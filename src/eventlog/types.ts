@@ -1,0 +1,234 @@
+// =============================================================================
+// Vault Overseer — Event Log Types
+// src/eventlog/types.ts
+//
+// Schema: Event Log Schema v0.2, rev. 2026-10-20 (schema v: 1)
+// Scope:   Phase 1 subset — file events, chunk events, integrity events.
+//          The remaining catalog types (link.*, embed.batch, skill.*,
+//          write.*, session.*, settings.*, log.checkpoint) are transcribed
+//          only when they gain fixture-loaded consumers. Inventory that has
+//          never been bitten by a fixture is "survived the meetings" — banned.
+//
+// Doctrine:
+//   - Envelope key order is NORMATIVE: v, seq, ts, origin, actor, type,
+//     then payload fields in the order declared in each interface below.
+//   - The serializer OWNS assembly. Callers never hand-construct event
+//     lines. One implementation, not two drifting copies.
+//   - ts is caller-supplied: ISO 8601 with offset, origin-local wall clock.
+//     Diagnostic only — never trusted for ordering. The serializer stays
+//     pure; clock injection belongs to EventLog/spawnContext.
+//   - Line format: compact JSON, one event per line, '\n'-terminated.
+//     The trailing newline is the completeness marker — F01's torn-tail
+//     detection is precisely "final line lacks its terminator."
+// =============================================================================
+
+/** Envelope schema version. Forward-only migrations keyed on this. */
+export const SCHEMA_VERSION = 1 as const;
+
+/** Attribution by record, not archaeology. */
+export type Actor = 'user' | 'plugin' | 'sync';
+
+/**
+ * Per-device origin id ('mokka' | 'latitude' in production).
+ * Kept as a loose string: the foreign-origin guard at startup is the
+ * schema's enforcement mechanism, not the type system's job.
+ */
+export type Origin = string;
+
+/** Paths: vault-relative, POSIX separators, no leading slash. */
+export type VaultPath = string;
+
+/** SHA-256 of full note file bytes, truncated to 16 hex chars. */
+export type ContentSha = string;
+
+/** SHA-256 of the exact prefixed string sent to the embedder. */
+export type VectorHash = string;
+
+// -----------------------------------------------------------------------------
+// Event types — Phase 1 subset
+// -----------------------------------------------------------------------------
+
+export type EventType =
+// Tier 1 — file facts (write-through)
+| 'note.created'
+| 'note.modified'
+| 'note.deleted'
+| 'note.renamed'
+| 'note.conflicted'
+// Tier 2 — buffered
+| 'note.opened'
+| 'chunk.indexed'
+| 'chunk.evicted'
+// Tier 1 — ops: integrity + checkpoints (write-through; silence is disqualifying)
+| 'log.integrity'
+// Tier 1 — ops: checkpoint digest (write-through; witnessed by F11)
+| 'log.checkpoint';
+
+// -----------------------------------------------------------------------------
+// Payloads — field order below is the serialization order. Do not reorder.
+// -----------------------------------------------------------------------------
+
+export interface NoteCreatedPayload {
+    readonly path: VaultPath;
+    readonly mtime: number;
+    readonly bytes: number;
+    readonly content_sha: ContentSha;
+}
+
+export interface NoteModifiedPayload {
+    readonly path: VaultPath;
+    readonly mtime: number;
+    readonly bytes: number;
+    readonly content_sha: ContentSha;
+}
+
+export interface NoteDeletedPayload {
+    readonly path: VaultPath;
+    readonly last_content_sha: ContentSha;
+}
+
+export interface NoteRenamedPayload {
+    readonly from: VaultPath;
+    readonly to: VaultPath;
+}
+
+export interface NoteConflictedPayload {
+    readonly path: VaultPath;
+    readonly conflict_copy_path: VaultPath;
+}
+
+export interface NoteOpenedPayload {
+    readonly path: VaultPath;
+    /** Dwell in whole seconds, rounded down. Gate: >= 10s before emission. */
+    readonly dwell: number;
+}
+
+export interface ChunkIndexedPayload {
+    readonly path: VaultPath;
+    readonly ord: number;
+    /** Byte offset, inclusive: start of first paragraph's first byte. */
+    readonly bs: number;
+    /** Byte offset, exclusive: end of last paragraph's last byte. [bs, be). */
+    readonly be: number;
+    readonly vh: VectorHash;
+    /** Chunk policy version. Owned by the chunker; the log never interprets. */
+    readonly cp: number;
+}
+
+export interface ChunkEvictedPayload {
+    readonly vh: VectorHash;
+    readonly path: VaultPath;
+}
+
+export interface LogIntegrityPayload {
+    /**
+     * Loud, named, actionable. E.g. torn-tail: origin, offending byte length,
+     * recovered-through seq. Gap: (origin, expected_seq, got_seq).
+     */
+    readonly detail: string;
+}
+
+export interface LogCheckpointPayload {
+    /** Highest seq covered by the digest — always this event's seq − 1. */
+    readonly last_seq: number;
+    /** Total events covered (== last_seq at v1; explicit per schema catalog). */
+    readonly events: number;
+    /** Rolling digest over lines 1..last_seq, inclusive. */
+    readonly digest: string;
+}
+
+// -----------------------------------------------------------------------------
+// Event union — discriminated on `type`
+// -----------------------------------------------------------------------------
+
+interface Envelope {
+    readonly v: typeof SCHEMA_VERSION;
+    readonly seq: number;
+    readonly ts: string;
+    readonly origin: Origin;
+    readonly actor: Actor;
+    readonly type: EventType;
+}
+
+export interface NoteCreatedEvent extends Envelope { readonly type: 'note.created'; readonly payload: NoteCreatedPayload; }
+export interface NoteModifiedEvent extends Envelope { readonly type: 'note.modified'; readonly payload: NoteModifiedPayload; }
+export interface NoteDeletedEvent extends Envelope { readonly type: 'note.deleted'; readonly payload: NoteDeletedPayload; }
+export interface NoteRenamedEvent extends Envelope { readonly type: 'note.renamed'; readonly payload: NoteRenamedPayload; }
+export interface NoteConflictedEvent extends Envelope { readonly type: 'note.conflicted'; readonly payload: NoteConflictedPayload; }
+export interface NoteOpenedEvent extends Envelope { readonly type: 'note.opened'; readonly payload: NoteOpenedPayload; }
+export interface ChunkIndexedEvent extends Envelope { readonly type: 'chunk.indexed'; readonly payload: ChunkIndexedPayload; }
+export interface ChunkEvictedEvent extends Envelope { readonly type: 'chunk.evicted'; readonly payload: ChunkEvictedPayload; }
+export interface LogIntegrityEvent extends Envelope { readonly type: 'log.integrity'; readonly payload: LogIntegrityPayload; }
+export interface LogCheckpointEvent extends Envelope { readonly type: 'log.checkpoint'; readonly payload: LogCheckpointPayload; }
+
+export type VaultOverseerEvent =
+| NoteCreatedEvent
+| NoteModifiedEvent
+| NoteDeletedEvent
+| NoteRenamedEvent
+| NoteConflictedEvent
+| NoteOpenedEvent
+| ChunkIndexedEvent
+| ChunkEvictedEvent
+| LogIntegrityEvent
+| LogCheckpointEvent;
+
+// -----------------------------------------------------------------------------
+// Serializer — the single owner of line assembly
+// -----------------------------------------------------------------------------
+
+/**
+ * Build the payload object with fields in normative order.
+ * Exhaustive over the Phase 1 union: adding an EventType without adding
+ * a case is a compile error via the `never` assignment check.
+ */
+function payloadInOrder(event: VaultOverseerEvent): Record<string, unknown> {
+    const p = event.payload;
+    switch (event.type) {
+        case 'note.created':
+            return { path: p.path, mtime: p.mtime, bytes: p.bytes, content_sha: p.content_sha };
+        case 'note.modified':
+            return { path: p.path, mtime: p.mtime, bytes: p.bytes, content_sha: p.content_sha };
+        case 'note.deleted':
+            return { path: p.path, last_content_sha: p.last_content_sha };
+        case 'note.renamed':
+            return { from: p.from, to: p.to };
+        case 'note.conflicted':
+            return { path: p.path, conflict_copy_path: p.conflict_copy_path };
+        case 'note.opened':
+            return { path: p.path, dwell: p.dwell };
+        case 'chunk.indexed':
+            return { path: p.path, ord: p.ord, bs: p.bs, be: p.be, vh: p.vh, cp: p.cp };
+        case 'chunk.evicted':
+            return { vh: p.vh, path: p.path };
+        case 'log.integrity':
+            return { detail: p.detail };
+        case 'log.checkpoint':
+            return { last_seq: p.last_seq, events: p.events, digest: p.digest };
+        default: {
+            // Compile-time exhaustiveness: unknown event types cannot occur.
+            const unreachable: never = event;
+            return { detail: `unreachable: ${JSON.stringify(unreachable)}` };
+        }
+    }
+}
+
+/**
+ * Serialize one event into one compact JSONL line, '\n'-terminated.
+ * Envelope keys in normative order, then payload fields in normative order.
+ * Pure: no clock, no I/O, no randomness. Same input ⇒ same line, always,
+ * on both machines (F04/P3 depend on this).
+ */
+export function serializeEvent(event: VaultOverseerEvent): string {
+    const payload = payloadInOrder(event);
+    const line = {
+        v: event.v,
+        seq: event.seq,
+        ts: event.ts,
+        origin: event.origin,
+        actor: event.actor,
+        type: event.type,
+        ...payload,
+    };
+    return JSON.stringify(line) + '\n';
+}

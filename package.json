@@ -1,0 +1,19 @@
+{
+  "name": "vault-overseer-index",
+  "version": "0.1.0",
+  "description": "Vault Overseer — Plugin 1: event-log spine and indexer",
+  "main": "main.js",
+  "type": "module",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "node esbuild.config.mjs production"
+  },
+  "devDependencies": {
+    "@types/node": "latest",
+    "builtin-modules": "latest",
+    "esbuild": "latest",
+    "obsidian": "latest",
+    "tslib": "latest",
+    "typescript": "latest"
+  }
+}
