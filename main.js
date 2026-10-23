@@ -439,8 +439,10 @@ async function startupChecks(source, origin, eventsDir) {
 }
 
 // src/main.ts
+var os = require("os");
 var EVENTS_DIR = "_vault-index/events";
-var DEFAULT_SETTINGS = { origin: "mokka" };
+var ORIGIN_FILE = "origin.txt";
+var DEFAULT_SETTINGS = {};
 var VaultLogAdapter = class {
   constructor(inner) {
     this.inner = inner;
@@ -464,6 +466,12 @@ var VaultLogAdapter = class {
     const buf = await this.inner.readBinary(p);
     return new Uint8Array(buf);
   }
+  async readUtf8(path) {
+    const p = (0, import_obsidian.normalizePath)(path);
+    if (!await this.inner.exists(p)) return void 0;
+    const bytes = new Uint8Array(await this.inner.readBinary(p));
+    return new TextDecoder("utf-8").decode(bytes);
+  }
   async listDir(path) {
     const listing = await this.inner.list((0, import_obsidian.normalizePath)(path));
     return listing.files.map((f) => f.slice(f.lastIndexOf("/") + 1)).sort();
@@ -476,25 +484,96 @@ async function sha256Hex(text, len = 16) {
   );
   return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, "0")).join("").slice(0, len);
 }
+async function resolveOrigin(adapter, pluginFolder) {
+  const originPath = `${pluginFolder}/${ORIGIN_FILE}`;
+  if (await adapter.exists(originPath)) {
+    const raw = await adapter.readUtf8(originPath);
+    const candidate = raw?.trim() ?? "";
+    if (candidate.length > 0) {
+      return {
+        origin: candidate,
+        foundShards: [],
+        foundOrigins: [],
+        fromOriginFile: true
+      };
+    }
+  }
+  let foundShards = [];
+  if (await adapter.exists(EVENTS_DIR)) {
+    foundShards = (await adapter.listDir(EVENTS_DIR)).filter(
+      (n) => n.endsWith(".jsonl")
+    );
+  }
+  const foundOrigins = foundShards.map((n) => n.replace(/\.jsonl$/, "")).sort();
+  if (foundOrigins.length > 0) {
+    return {
+      origin: null,
+      foundShards,
+      foundOrigins,
+      fromOriginFile: false
+    };
+  }
+  return {
+    origin: os.hostname(),
+    foundShards: [],
+    foundOrigins: [],
+    fromOriginFile: false
+  };
+}
+async function writeOriginFile(adapter, pluginFolder, origin) {
+  const originPath = `${pluginFolder}/${ORIGIN_FILE}`;
+  await adapter.write(originPath, `${origin}
+`);
+}
 var VaultOverseerIndex = class extends import_obsidian.Plugin {
   settings;
   log = null;
+  /** The resolved machine identity — never sourced from data.json. */
+  originId = null;
+  /** Rung 2 pending: shard names awaiting human certification. */
+  pendingCertification = null;
   /** True after onload when the foreign-origin guard fired — writer refused. */
   writerBlocked = false;
   /**
-   * True if startup chain verification failed: the shard's checkpoint digest
-   * does not match its contents. The writer STILL RECORDS (see onload
-   * rationale) — this flag drives the settings-tab warning only.
+   * True if startup chain verification failed: the shard's checkpoint
+   * digest does not match its contents. The writer STILL RECORDS
+   * (see onload rationale) — this flag drives the settings-tab
+   * warning only.
    */
   chainBroken = false;
+  /**
+   * data.json carried a legacy `origin` field that was scrubbed at
+   * load. Logged once the writer exists; surfaced in settings so the
+   * scrub is never silent.
+   */
+  scrubbedLegacyOrigin = null;
   async onload() {
     await this.loadSettings();
-    this.addSettingTab(new OverseerSettingTab(this.app, this));
     const adapter = new VaultLogAdapter(this.app.vault.adapter);
-    const startup = await startupChecks(adapter, this.settings.origin, EVENTS_DIR);
+    const pluginFolder = this.manifest.dir ?? `.obsidian/plugins/${this.manifest.id}`;
+    const resolution = await resolveOrigin(adapter, pluginFolder);
+    if (resolution.origin === null) {
+      this.pendingCertification = resolution.foundOrigins;
+      new import_obsidian.Notice(
+        "Vault Overseer: no origin.txt and shards exist \u2014 open Settings \u2192 Vault Overseer to certify this machine's identity.",
+        15e3
+      );
+    } else {
+      await this.startWriter(adapter, resolution.origin, resolution.fromOriginFile);
+    }
+    this.addSettingTab(new OverseerSettingTab(this.app, this));
+  }
+  /**
+   * Construct the writer, run startup checks + chain verification,
+   * and emit the session-opened beacon. Shared by the Rung-1/3 onload
+   * path and the Rung-2 certification path.
+   */
+  async startWriter(adapter, origin, fromOriginFile) {
+    this.originId = origin;
+    const startup = await startupChecks(adapter, origin, EVENTS_DIR);
     if (startup.foreignOrigin) {
       const detail = startup.integrity.map((r) => r.detail).join("; ");
-      const msg = `Vault Overseer: foreign origin in shard tail for '${this.settings.origin}' \u2014 writer DISABLED. Fix the origin setting or the shard, then reload.`;
+      const msg = `Vault Overseer: foreign origin in shard tail for '${origin}' \u2014 writer DISABLED. Fix the origin or the shard, then reload.`;
       console.error("[vault-overseer]", msg, detail);
       new import_obsidian.Notice(msg, 15e3);
       this.writerBlocked = true;
@@ -502,21 +581,32 @@ var VaultOverseerIndex = class extends import_obsidian.Plugin {
     }
     this.log = new EventLog({
       adapter,
-      origin: this.settings.origin,
+      origin,
       eventsDir: EVENTS_DIR,
       initialSeq: startup.recoveredThroughSeq,
       now: () => defaultLocalIso(),
       hasTornTail: startup.tornTail
     });
-    const shardPath = `${EVENTS_DIR}/${this.settings.origin}.jsonl`;
+    if (!fromOriginFile) {
+      await this.log.reportIntegrity(
+        `origin.migrated-interim: origin.txt created with id='${origin}' (hostname-seeded virgin install or human certification)`
+      );
+    }
+    if (this.scrubbedLegacyOrigin !== null) {
+      await this.log.reportIntegrity(
+        `settings.changed-interim: keys=[origin], scrubbed_from_data_json='${this.scrubbedLegacyOrigin}' \u2014 field is dead in 0.1.1+, never read`
+      );
+      this.scrubbedLegacyOrigin = null;
+    }
+    const shardPath = `${EVENTS_DIR}/${origin}.jsonl`;
     try {
-      const chain = await verifyChain(adapter, shardPath, this.settings.origin);
+      const chain = await verifyChain(adapter, shardPath, origin);
       if (!chain.valid) {
         this.chainBroken = true;
         const detail = chain.detail ?? "unknown chain failure";
         console.error("[vault-overseer] chain verification FAILED:", detail);
         new import_obsidian.Notice(
-          `Vault Overseer: checkpoint chain verification FAILED for '${this.settings.origin}' \u2014 shard integrity is compromised. Details recorded in the event log.`,
+          `Vault Overseer: checkpoint chain verification FAILED for '${origin}' \u2014 shard integrity is compromised. Details recorded in the event log.`,
           15e3
         );
       }
@@ -532,7 +622,7 @@ var VaultOverseerIndex = class extends import_obsidian.Plugin {
       );
     }
     if (this.chainBroken) {
-      const chain = await verifyChain(adapter, shardPath, this.settings.origin);
+      const chain = await verifyChain(adapter, shardPath, origin);
       await this.log.reportIntegrity(
         `chain verification failed: ${chain.detail ?? "unknown chain failure"}`
       );
@@ -548,7 +638,8 @@ var VaultOverseerIndex = class extends import_obsidian.Plugin {
   }
   /**
    * Public API surface for Plugin 2 (and anything else). Null while the
-   * writer is blocked (foreign-origin) or unloaded — callers must handle it.
+   * writer is blocked (foreign-origin, Rung-2 uncertified) or unloaded —
+   * callers must handle it.
    */
   getApi() {
     if (this.log === null) return null;
@@ -560,8 +651,20 @@ var VaultOverseerIndex = class extends import_obsidian.Plugin {
       }
     };
   }
+  /**
+   * Rung 4 enforcement + shared-knob load. The legacy `origin` field,
+   * if ferried in by Sync, is scrubbed from disk immediately —
+   * whatever data.json wins the sync race, it cannot lie about
+   * identity because nobody ever reads the field again.
+   */
   async loadSettings() {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    const persisted = await this.loadData();
+    if (persisted !== null && "origin" in persisted) {
+      this.scrubbedLegacyOrigin = typeof persisted.origin === "string" ? persisted.origin : null;
+      delete persisted.origin;
+      await this.saveData(persisted);
+    }
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, persisted ?? {});
   }
   async saveSettings(next) {
     const changed = Object.keys(next).filter(
@@ -575,6 +678,21 @@ var VaultOverseerIndex = class extends import_obsidian.Plugin {
       );
     }
   }
+  /**
+   * Rung 2 completion: human-certify this machine against an existing
+   * shard (or a brand-new id). Writes origin.txt, then boots the writer
+   * through the same startWriter() path the automatic rungs use.
+   */
+  async certifyOrigin(origin) {
+    const trimmed = origin.trim();
+    if (trimmed.length === 0) return;
+    const adapter = new VaultLogAdapter(this.app.vault.adapter);
+    const pluginFolder = this.manifest.dir ?? `.obsidian/plugins/${this.manifest.id}`;
+    await writeOriginFile(adapter, pluginFolder, trimmed);
+    this.pendingCertification = null;
+    await this.startWriter(adapter, trimmed, false);
+    this.app.setting?.activeTab?.display?.();
+  }
 };
 var OverseerSettingTab = class extends import_obsidian.PluginSettingTab {
   plugin;
@@ -586,15 +704,37 @@ var OverseerSettingTab = class extends import_obsidian.PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
     new import_obsidian.Setting(containerEl).setName("Origin (device id)").setDesc(
-      "Per-device shard id \u2014 the spine file this machine writes. Changing it takes effect after a plugin reload (the startup guard re-runs). mokka / latitude on this setup."
+      "Per-device shard id. Identity lives in origin.txt inside the plugin folder \u2014 sync-excluded, BRAT-proof. Edit that file (or certify below) to change it; the origin setting itself is gone from data.json."
     ).addText(
-      (text) => text.setPlaceholder("mokka").setValue(this.plugin.settings.origin).onChange(async (value) => {
-        await this.plugin.saveSettings({ origin: value.trim() });
-        new import_obsidian.Notice(
-          "Vault Overseer: origin changed \u2014 reload the plugin (or restart Obsidian) to re-run startup checks."
-        );
-      })
+      (text) => text.setPlaceholder("uncertified").setValue(this.plugin.originId ?? "").setDisabled(true)
     );
+    if (this.plugin.pendingCertification !== null) {
+      containerEl.createEl("h3", { text: "Certify this machine's identity" });
+      containerEl.createEl("p", {
+        text: "Shards exist in this vault but this machine has no origin.txt. Identity cannot be inferred from synced state \u2014 pick which shard this machine writes, or declare a new device id. Nothing is appended until this is answered.",
+        cls: "mod-info"
+      });
+      for (const candidate of this.plugin.pendingCertification) {
+        new import_obsidian.Setting(containerEl).setName(candidate).setDesc(`Continue writing the existing ${candidate}.jsonl shard.`).addButton(
+          (btn) => btn.setButtonText(`Certify as '${candidate}'`).onClick(() => void this.plugin.certifyOrigin(candidate))
+        );
+      }
+      const newIdSetting = new import_obsidian.Setting(containerEl).setName("New device id").setDesc("Start a brand-new shard for a machine not listed above.");
+      let newValue = "";
+      newIdSetting.addText(
+        (text) => text.setPlaceholder("e.g. phone-1").onChange((value) => {
+          newValue = value;
+          newIdSetting.setTooltip(value);
+        })
+      );
+      newIdSetting.addButton(
+        (btn) => btn.setButtonText("Create new origin").onClick(() => {
+          if (newValue.trim().length > 0) {
+            void this.plugin.certifyOrigin(newValue.trim());
+          }
+        })
+      );
+    }
     if (this.plugin.writerBlocked) {
       containerEl.createEl("p", {
         text: "\u26A0 Writer BLOCKED: foreign origin detected in the shard tail. Resolve the mismatch, then reload the plugin.",
