@@ -3,9 +3,27 @@
 // src/main.ts
 //
 // The Obsidian bootstrap: resolve machine identity, run startup checks,
-// construct the EventLog writer, verify the checkpoint chain, and expose
-// the Plugin 2 seam. Everything here is wiring; the spine's semantics
-// live in src/eventlog/*.
+// construct the EventLog writer, verify the checkpoint chain, run the
+// F03 heal scan, and expose the Plugin 2 seam. Everything here is wiring;
+// the spine's semantics live in src/eventlog/*.
+//
+// 0.1.3-bound — F03 HEAL SCAN WIRING (ratified 2026-10-23):
+//
+//   healScan() now runs inside startWriter, after the chain-verification
+//   fold and after the session.opened beacon. Placement doctrine: the
+//   writer must exist (heal appends chunk.indexed + log.integrity); the
+//   beacon lands FIRST so the session record precedes derived
+//   re-derivation work; the heal owns its own refusal lane (seq gaps =>
+//   loud refusal, never-fabricate) independent of chain verification.
+//   Wrapped in its own guard so a heal throw reports through the ledger
+//   instead of escaping onload — same doctrine as the chain fold.
+//
+//   Runtime receipt owed: heal.ts uses the Node `Buffer` global in its
+//   P1 re-render path. The require('os') spike proved the renderer
+//   accepts CommonJS, so Buffer is expected present — but esbuild does
+//   not verify globals, and the P1 lane only executes when chunk
+//   records exist. Verify with `typeof Buffer` in devtools before
+//   trusting the first healed shard.
 //
 // 0.1.2 — RUNG 3 DELETED (design ratified 2026-10-23):
 //
@@ -29,7 +47,7 @@
 //           and demands HUMAN certification (continue an existing
 //           shard or declare a new id; a virgin install simply gets
 //           an empty candidate list). No machine ever infers identity
-//           from ferried state or from the OS. Certification is
+//           from synced state or from the OS. Certification is
 //           logged as origin.migrated-interim.
 //   Rung 4  data.json's origin field is NEVER read again. If present
 //           it is scrubbed on load and the scrub is logged as a
@@ -97,6 +115,7 @@ import {
 import { EventLog, defaultLocalIso } from './eventlog/eventlog.ts';
 import { startupChecks } from './eventlog/reader.ts';
 import { verifyChain } from './eventlog/checkpoint.ts';
+import { healScan } from './eventlog/heal.ts';
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -449,8 +468,9 @@ export default class VaultOverseerIndex extends Plugin {
 
     /**
      * Construct the writer, run startup checks + chain verification,
-     * and emit the session-opened beacon. Shared by the Rung-1 onload
-     * path and the Rung-2 certification path.
+     * run the F03 heal scan, and emit the session-opened beacon order.
+     * Shared by the Rung-1 onload path and the Rung-2 certification
+     * path.
      */
     private async startWriter(
         adapter: VaultLogAdapter,
@@ -542,6 +562,28 @@ export default class VaultOverseerIndex extends Plugin {
         await this.log.reportIntegrity(
             `session.opened-interim: plugin_versions=vault-overseer-index@${this.manifest.version}, settings_sha=${settingsSha}`,
         );
+
+        // -----------------------------------------------------------------
+        // F03 heal scan — re-derive Tier-2 chunks from vault bytes.
+        // Runs AFTER the session beacon (the session record precedes
+        // derived re-derivation work). The scan owns its refusal lane:
+        // a seq gap halts the projection and heal refuses loudly via
+        // log.integrity, independent of chain verification above. Its
+        // own emissions (chunk.indexed, "buffer window lost" reports)
+        // ride the same serialized queue as everything else.
+        //
+        // Guard doctrine: a heal throw reports through the ledger and
+        // does NOT escape startWriter — nothing may kill the writer
+        // after the beacon has landed. A refused heal is a RECORDED
+        // refusal, not a failed boot.
+        // -----------------------------------------------------------------
+        try {
+            await healScan(this.log, adapter, EVENTS_DIR);
+        } catch (err) {
+            const detail = err instanceof Error ? err.message : String(err);
+            console.error('[vault-overseer] heal scan threw:', detail);
+            await this.log.reportIntegrity(`heal scan threw: ${detail}`);
+        }
     }
 
     /**
@@ -739,8 +781,8 @@ class OverseerSettingTab extends PluginSettingTab {
 
         if (this.plugin.writerBlocked) {
             containerEl.createEl('p', {
-                text: '⚠ Writer BLOCKED: foreign origin detected in the shard tail. ' +
-                'Resolve the mismatch, then reload the plugin.',
+                text: '⚠ Writer BLOCKED: foreign origin detected in the shard ' +
+                'tail. Resolve the mismatch, then reload the plugin.',
                 cls: 'mod-warning',
             });
         }

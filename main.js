@@ -437,6 +437,234 @@ async function startupChecks(source, origin, eventsDir) {
     integrity
   };
 }
+async function mergeScan(source, eventsDir) {
+  const names = await source.listDir(eventsDir);
+  const shards = names.filter((n) => n.endsWith(".jsonl")).sort();
+  const originOrder = /* @__PURE__ */ new Map();
+  shards.forEach((n, i) => originOrder.set(n.replace(/\.jsonl$/, ""), i));
+  const events = [];
+  const integrity = [];
+  const gaps = [];
+  for (const name of shards) {
+    const origin = name.replace(/\.jsonl$/, "");
+    const bytes = await source.readBinary(`${eventsDir}/${name}`);
+    if (bytes === void 0) continue;
+    const { lines, torn } = splitCompleteLines(bytes);
+    if (torn !== null) {
+      integrity.push({
+        detail: `torn tail: (origin: ${origin}, bytes: ${torn.length})`
+      });
+    }
+    let expected = 1;
+    for (const raw of lines) {
+      const line = parseLine(raw);
+      if (line === null) {
+        integrity.push({
+          detail: `unreadable line: (origin: ${origin}, expected_seq: ${expected})`
+        });
+        continue;
+      }
+      const seq = typeof line.seq === "number" ? line.seq : -1;
+      if (seq !== expected) {
+        gaps.push({ origin, expected_seq: expected, got_seq: seq });
+        integrity.push({
+          detail: `gap: (origin: ${origin}, expected_seq: ${expected}, got_seq: ${seq})`
+        });
+        break;
+      }
+      events.push(line);
+      expected++;
+    }
+  }
+  events.sort((a, b) => {
+    const oa = originOrder.get(String(a.origin)) ?? 999;
+    const ob = originOrder.get(String(b.origin)) ?? 999;
+    if (oa !== ob) return oa - ob;
+    return (typeof a.seq === "number" ? a.seq : 0) - (typeof b.seq === "number" ? b.seq : 0);
+  });
+  return { events, integrity, gaps };
+}
+
+// src/chunker/render.ts
+var import_node_crypto2 = require("node:crypto");
+function sha16(bytes) {
+  return (0, import_node_crypto2.createHash)("sha256").update(bytes).digest("hex").slice(0, 16);
+}
+function contentSha(fileBytes) {
+  return sha16(fileBytes);
+}
+function canonScalarOrList(v) {
+  if (v === void 0) return null;
+  if (typeof v === "string") {
+    const t = v.trim();
+    return t === "" ? null : t;
+  }
+  const items = v.map((s) => s.trim()).filter((s) => s !== "");
+  return items.length === 0 ? null : items;
+}
+function serializeFmContext(fm) {
+  if (fm === null) return null;
+  const out = {};
+  const aliases = canonScalarOrList(fm.aliases);
+  if (aliases !== null) out.aliases = aliases;
+  if (typeof fm.description === "string") {
+    const t = fm.description.trim();
+    if (t !== "") out.description = t;
+  }
+  const tags = canonScalarOrList(fm.tags);
+  if (tags !== null) out.tags = tags;
+  if (typeof fm.type === "string") {
+    const t = fm.type.trim();
+    if (t !== "") out.type = t;
+  }
+  if (Object.keys(out).length === 0) return null;
+  return JSON.stringify(out);
+}
+function renderEmbedInput(taskPrefix, headingChain, fmContext, chunkText) {
+  let out = taskPrefix;
+  for (const heading of headingChain) out += heading + "\n";
+  const fm = serializeFmContext(fmContext);
+  if (fm !== null) out += fm + "\n";
+  return out + chunkText;
+}
+function embedVh(embedInput) {
+  return sha16(Buffer.from(embedInput, "utf-8"));
+}
+
+// src/chunker/stub.ts
+var STUB_CP = 0;
+var STUB_CHUNK_BYTES = 512;
+function chunkStub(fileBytes) {
+  const chunks = [];
+  let spanStart = 0;
+  let spanEnd = 0;
+  let spanBytes = 0;
+  const flush = () => {
+    if (spanBytes === 0) return;
+    const text = Buffer.from(fileBytes.subarray(spanStart, spanEnd)).toString("utf-8");
+    chunks.push({
+      ord: chunks.length,
+      bs: spanStart,
+      be: spanEnd,
+      vh: embedVh(renderEmbedInput("search_document:", [], null, text)),
+      cp: STUB_CP
+    });
+    spanBytes = 0;
+  };
+  let i = 0;
+  while (i < fileBytes.length) {
+    const nl = fileBytes.indexOf(10, i);
+    const lineEnd = nl === -1 ? fileBytes.length : nl + 1;
+    const lineLen = lineEnd - i;
+    if (spanBytes > 0 && spanBytes + lineLen > STUB_CHUNK_BYTES) flush();
+    if (spanBytes === 0) spanStart = i;
+    i = lineEnd;
+    spanEnd = lineEnd;
+    spanBytes += lineLen;
+  }
+  flush();
+  return chunks;
+}
+
+// src/eventlog/heal.ts
+async function healScan(log, source, eventsDir) {
+  const scan = await mergeScan(source, eventsDir);
+  if (scan.gaps.length > 0) {
+    for (const g of scan.gaps) {
+      await log.reportIntegrity(
+        `heal refused: seq gap (origin: ${g.origin}, expected_seq: ${g.expected_seq}, got_seq: ${g.got_seq}) \u2014 spine must be contiguous before re-derivation`
+      );
+    }
+    return {
+      pathsExamined: 0,
+      chunksReemitted: 0,
+      vhDeduped: 0,
+      p1Failures: 0,
+      p1Skipped: 0,
+      refused: true
+    };
+  }
+  const notePaths = /* @__PURE__ */ new Set();
+  const existingChunks = /* @__PURE__ */ new Map();
+  for (const e of scan.events) {
+    const t = String(e.type);
+    if (t === "note.created" || t === "note.modified") {
+      if (typeof e.path === "string") notePaths.add(e.path);
+    } else if (t === "note.renamed") {
+      if (typeof e.to === "string") notePaths.add(e.to);
+    } else if (t === "chunk.indexed" && typeof e.path === "string") {
+      const list = existingChunks.get(e.path) ?? [];
+      list.push(e);
+      existingChunks.set(e.path, list);
+    }
+  }
+  const result = {
+    pathsExamined: notePaths.size,
+    chunksReemitted: 0,
+    vhDeduped: 0,
+    p1Failures: 0,
+    p1Skipped: 0,
+    refused: false
+  };
+  for (const path of notePaths) {
+    const bytes = await source.readBinary(path);
+    if (bytes === void 0) {
+      await log.reportIntegrity(
+        `heal: file absent (path: ${path}) \u2014 chunk eviction owed to the real chunker, not improvised here`
+      );
+      continue;
+    }
+    const sha = contentSha(bytes);
+    const haveVh = new Set(
+      (existingChunks.get(path) ?? []).map((c) => String(c.vh))
+    );
+    let emitted = 0;
+    for (const chunk of chunkStub(bytes)) {
+      if (haveVh.has(chunk.vh)) {
+        result.vhDeduped++;
+        continue;
+      }
+      await log.appendEvent("plugin", "chunk.indexed", {
+        path,
+        ord: chunk.ord,
+        bs: chunk.bs,
+        be: chunk.be,
+        vh: chunk.vh,
+        cp: chunk.cp
+      });
+      emitted++;
+      result.chunksReemitted++;
+    }
+    if (emitted > 0) {
+      await log.reportIntegrity(
+        `buffer window lost, ${emitted} events re-derived from sha (path: ${path}, content_sha: ${sha})`
+      );
+    }
+    for (const rec of existingChunks.get(path) ?? []) {
+      const cp = Number(rec.cp);
+      if (cp !== 0) {
+        result.p1Skipped++;
+        await log.reportIntegrity(
+          `p1 skipped: unknown chunk policy (path: ${path}, ord: ${rec.ord}, cp: ${cp}) \u2014 verification owed to the policy's owner`
+        );
+        continue;
+      }
+      const bs = Number(rec.bs);
+      const be = Number(rec.be);
+      const text = Buffer.from(bytes.subarray(bs, be)).toString("utf-8");
+      const recomputed = embedVh(
+        renderEmbedInput("search_document:", [], null, text)
+      );
+      if (recomputed !== String(rec.vh)) {
+        result.p1Failures++;
+        await log.reportIntegrity(
+          `p1 violation: offsets fail to reproduce text (path: ${path}, ord: ${rec.ord}, bs: ${bs}, be: ${be})`
+        );
+      }
+    }
+  }
+  return result;
+}
 
 // src/main.ts
 var EVENTS_DIR = "_vault-index/events";
@@ -641,8 +869,9 @@ var VaultOverseerIndex = class extends import_obsidian.Plugin {
   // ---------------------------------------------------------------------------
   /**
    * Construct the writer, run startup checks + chain verification,
-   * and emit the session-opened beacon. Shared by the Rung-1 onload
-   * path and the Rung-2 certification path.
+   * run the F03 heal scan, and emit the session-opened beacon order.
+   * Shared by the Rung-1 onload path and the Rung-2 certification
+   * path.
    */
   async startWriter(adapter, origin, fromOriginFile) {
     this.originId = origin;
@@ -701,6 +930,13 @@ var VaultOverseerIndex = class extends import_obsidian.Plugin {
     await this.log.reportIntegrity(
       `session.opened-interim: plugin_versions=vault-overseer-index@${this.manifest.version}, settings_sha=${settingsSha}`
     );
+    try {
+      await healScan(this.log, adapter, EVENTS_DIR);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      console.error("[vault-overseer] heal scan threw:", detail);
+      await this.log.reportIntegrity(`heal scan threw: ${detail}`);
+    }
   }
   /**
    * SYNCHRONOUS, and the order below is load-bearing: farewell dwell
