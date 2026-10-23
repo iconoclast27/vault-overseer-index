@@ -15,5 +15,8 @@
     "obsidian": "latest",
     "tslib": "latest",
     "typescript": "latest"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true
   }
 }
