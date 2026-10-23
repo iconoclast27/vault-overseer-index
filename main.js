@@ -439,9 +439,10 @@ async function startupChecks(source, origin, eventsDir) {
 }
 
 // src/main.ts
-var os = require("os");
 var EVENTS_DIR = "_vault-index/events";
 var ORIGIN_FILE = "origin.txt";
+var DWELL_GATE_S = 10;
+var DWELL_GATE_MS = DWELL_GATE_S * 1e3;
 var DEFAULT_SETTINGS = {};
 var VaultLogAdapter = class {
   constructor(inner) {
@@ -505,18 +506,10 @@ async function resolveOrigin(adapter, pluginFolder) {
     );
   }
   const foundOrigins = foundShards.map((n) => n.replace(/\.jsonl$/, "")).sort();
-  if (foundOrigins.length > 0) {
-    return {
-      origin: null,
-      foundShards,
-      foundOrigins,
-      fromOriginFile: false
-    };
-  }
   return {
-    origin: os.hostname(),
-    foundShards: [],
-    foundOrigins: [],
+    origin: null,
+    foundShards,
+    foundOrigins,
     fromOriginFile: false
   };
 }
@@ -530,7 +523,10 @@ var VaultOverseerIndex = class extends import_obsidian.Plugin {
   log = null;
   /** The resolved machine identity — never sourced from data.json. */
   originId = null;
-  /** Rung 2 pending: shard names awaiting human certification. */
+  /**
+   * Rung 2 pending: origin ids awaiting human certification. Empty
+   * (but non-null) for a virgin install — no shards, no candidates.
+   */
   pendingCertification = null;
   /** True after onload when the foreign-origin guard fired — writer refused. */
   writerBlocked = false;
@@ -547,6 +543,18 @@ var VaultOverseerIndex = class extends import_obsidian.Plugin {
    * scrub is never silent.
    */
   scrubbedLegacyOrigin = null;
+  // --- Dwell-gate state (v1 threshold-only) ---
+  /** The note the user most recently opened, and when. */
+  activeNote = null;
+  /**
+   * Accrued dwell per path (ms) since that note's last note.opened
+   * emission — or since first open, if it never emitted. This is the
+   * accumulation lane: dwell banks across separate openings of the
+   * same note within a session.
+   */
+  dwellAccrued = /* @__PURE__ */ new Map();
+  /** Pending threshold timer for the active note. */
+  dwellTimer = null;
   async onload() {
     await this.loadSettings();
     const adapter = new VaultLogAdapter(this.app.vault.adapter);
@@ -555,17 +563,85 @@ var VaultOverseerIndex = class extends import_obsidian.Plugin {
     if (resolution.origin === null) {
       this.pendingCertification = resolution.foundOrigins;
       new import_obsidian.Notice(
-        "Vault Overseer: no origin.txt and shards exist \u2014 open Settings \u2192 Vault Overseer to certify this machine's identity.",
+        "Vault Overseer: no origin.txt \u2014 open Settings \u2192 Vault Overseer to certify this machine's identity.",
         15e3
       );
     } else {
       await this.startWriter(adapter, resolution.origin, resolution.fromOriginFile);
     }
+    this.registerEvent(
+      this.app.workspace.on("file-open", (file) => this.onFileOpen(file))
+    );
     this.addSettingTab(new OverseerSettingTab(this.app, this));
   }
+  // ---------------------------------------------------------------------------
+  // Dwell-gate internals (v1 threshold-only)
+  // ---------------------------------------------------------------------------
+  /**
+   * file-open receipt (obsidian.d.ts l.11041): callback receives the
+   * newly opened TFile, or null when no file is open. Switching notes
+   * banks the outgoing note's dwell WITHOUT emitting — the gate, not
+   * abandonment, is what earns an event.
+   */
+  onFileOpen(file) {
+    const now = Date.now();
+    if (this.activeNote !== null) {
+      this.bankDwell(this.activeNote, now);
+      this.activeNote = null;
+    }
+    if (this.dwellTimer !== null) {
+      clearTimeout(this.dwellTimer);
+      this.dwellTimer = null;
+    }
+    if (file === null) return;
+    this.activeNote = { path: file.path, openAt: now };
+    this.armDwellTimer(file.path);
+  }
+  /** Add the active note's elapsed dwell to its accrual lane. */
+  bankDwell(note, now) {
+    const elapsed = now - note.openAt;
+    this.dwellAccrued.set(note.path, (this.dwellAccrued.get(note.path) ?? 0) + elapsed);
+  }
+  /**
+   * Arm the threshold timer for the given remaining dwell: the gate
+   * minus whatever this note has already banked this session.
+   */
+  armDwellTimer(path) {
+    const accrued = this.dwellAccrued.get(path) ?? 0;
+    const remaining = DWELL_GATE_MS - accrued;
+    if (remaining <= 0) {
+      this.onDwellGateCrossed(path);
+      return;
+    }
+    this.dwellTimer = setTimeout(() => {
+      this.onDwellGateCrossed(path);
+    }, remaining);
+  }
+  /**
+   * The gate was crossed: emit one note.opened (dwell=10 flat, v1),
+   * then reset that note's accrual. Continued dwelling after the
+   * emission banks toward the farewell flush only — one event per
+   * gate crossing, per the ratified semantics.
+   */
+  onDwellGateCrossed(path) {
+    this.dwellTimer = null;
+    this.dwellAccrued.set(path, 0);
+    if (this.activeNote !== null && this.activeNote.path === path) {
+      this.activeNote.openAt = Date.now();
+    }
+    void this.emitDwell(path, DWELL_GATE_S);
+  }
+  /** Tier-2 append through the writer's public API. Drops silently while dark. */
+  async emitDwell(path, dwell) {
+    if (this.log === null) return;
+    await this.log.appendEvent("user", "note.opened", { path, dwell });
+  }
+  // ---------------------------------------------------------------------------
+  // Writer boot
+  // ---------------------------------------------------------------------------
   /**
    * Construct the writer, run startup checks + chain verification,
-   * and emit the session-opened beacon. Shared by the Rung-1/3 onload
+   * and emit the session-opened beacon. Shared by the Rung-1 onload
    * path and the Rung-2 certification path.
    */
   async startWriter(adapter, origin, fromOriginFile) {
@@ -589,7 +665,7 @@ var VaultOverseerIndex = class extends import_obsidian.Plugin {
     });
     if (!fromOriginFile) {
       await this.log.reportIntegrity(
-        `origin.migrated-interim: origin.txt created with id='${origin}' (hostname-seeded virgin install or human certification)`
+        `origin.migrated-interim: origin.txt created with id='${origin}' via human certification (settings surface)`
       );
     }
     if (this.scrubbedLegacyOrigin !== null) {
@@ -598,33 +674,27 @@ var VaultOverseerIndex = class extends import_obsidian.Plugin {
       );
       this.scrubbedLegacyOrigin = null;
     }
-    const shardPath = `${EVENTS_DIR}/${origin}.jsonl`;
+    let chainDetail = null;
     try {
-      const chain = await verifyChain(adapter, shardPath, origin);
+      const chain = await verifyChain(adapter, `${EVENTS_DIR}/${origin}.jsonl`, origin);
       if (!chain.valid) {
-        this.chainBroken = true;
-        const detail = chain.detail ?? "unknown chain failure";
-        console.error("[vault-overseer] chain verification FAILED:", detail);
-        new import_obsidian.Notice(
-          `Vault Overseer: checkpoint chain verification FAILED for '${origin}' \u2014 shard integrity is compromised. Details recorded in the event log.`,
-          15e3
-        );
+        chainDetail = chain.detail ?? "unknown chain failure";
       }
     } catch (err) {
+      chainDetail = `chain verification threw: ${err instanceof Error ? err.message : String(err)}`;
+    }
+    if (chainDetail !== null) {
       this.chainBroken = true;
-      const detail = err instanceof Error ? err.message : String(err);
-      console.error("[vault-overseer] chain verification threw:", detail);
-      await this.log.reportIntegrity(`chain verification threw: ${detail}`);
+      console.error("[vault-overseer] chain verification FAILED:", chainDetail);
+      new import_obsidian.Notice(
+        `Vault Overseer: checkpoint chain verification FAILED for '${origin}' \u2014 shard integrity is compromised. Details recorded in the event log.`,
+        15e3
+      );
+      await this.log.reportIntegrity(`chain verification failed: ${chainDetail}`);
     }
     if (startup.integrity.length > 0) {
       await this.log.reportIntegrity(
         startup.integrity.map((r) => r.detail).join("; ")
-      );
-    }
-    if (this.chainBroken) {
-      const chain = await verifyChain(adapter, shardPath, origin);
-      await this.log.reportIntegrity(
-        `chain verification failed: ${chain.detail ?? "unknown chain failure"}`
       );
     }
     const settingsSha = await sha256Hex(JSON.stringify(this.settings));
@@ -632,7 +702,32 @@ var VaultOverseerIndex = class extends import_obsidian.Plugin {
       `session.opened-interim: plugin_versions=vault-overseer-index@${this.manifest.version}, settings_sha=${settingsSha}`
     );
   }
+  /**
+   * SYNCHRONOUS, and the order below is load-bearing: farewell dwell
+   * events are APPENDED (into the serialized write queue) before
+   * dispose() is called, so the queue flushes them ahead of the
+   * farewell drain. The serialized queue makes the race impossible;
+   * this ordering is why dispose() sees them.
+   *
+   * Farewell gate ruling (v1, per F09, ratified): dwell below 10s
+   * emits NOTHING at session end — a swipe-through doesn't become
+   * signal just because Obsidian was closing.
+   */
   onunload() {
+    if (this.activeNote !== null) {
+      this.bankDwell(this.activeNote, Date.now());
+      this.activeNote = null;
+    }
+    if (this.dwellTimer !== null) {
+      clearTimeout(this.dwellTimer);
+      this.dwellTimer = null;
+    }
+    for (const [path, accrued] of this.dwellAccrued) {
+      if (accrued >= DWELL_GATE_MS) {
+        void this.emitDwell(path, Math.floor(accrued / 1e3));
+      }
+    }
+    this.dwellAccrued.clear();
     void this.log?.dispose();
     this.log = null;
   }
@@ -681,7 +776,7 @@ var VaultOverseerIndex = class extends import_obsidian.Plugin {
   /**
    * Rung 2 completion: human-certify this machine against an existing
    * shard (or a brand-new id). Writes origin.txt, then boots the writer
-   * through the same startWriter() path the automatic rungs use.
+   * through the same startWriter() path the Rung-1 path uses.
    */
   async certifyOrigin(origin) {
     const trimmed = origin.trim();
@@ -711,7 +806,7 @@ var OverseerSettingTab = class extends import_obsidian.PluginSettingTab {
     if (this.plugin.pendingCertification !== null) {
       containerEl.createEl("h3", { text: "Certify this machine's identity" });
       containerEl.createEl("p", {
-        text: "Shards exist in this vault but this machine has no origin.txt. Identity cannot be inferred from synced state \u2014 pick which shard this machine writes, or declare a new device id. Nothing is appended until this is answered.",
+        text: "This machine has no origin.txt \u2014 identity cannot be inferred from synced state or from the OS. Pick which shard this machine writes, or declare a new device id (a virgin install offers only the new-id option). Nothing is appended until this is answered.",
         cls: "mod-info"
       });
       for (const candidate of this.plugin.pendingCertification) {

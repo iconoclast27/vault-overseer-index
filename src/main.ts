@@ -7,32 +7,82 @@
 // the Plugin 2 seam. Everything here is wiring; the spine's semantics
 // live in src/eventlog/*.
 //
-// 0.1.1 — ORIGIN RESOLUTION LADDER (fixes the origin-identity flaw found
-// and designed 2026-10-23):
+// 0.1.2 — RUNG 3 DELETED (design ratified 2026-10-23):
+//
+//   The former Rung 3 (virgin install => os.hostname() seed) never
+//   called writeOriginFile() while startWriter claimed it had — a
+//   never-fabricate violation, dormant only because every machine
+//   took Rung 2. Identity-by-inference also contradicts the ladder's
+//   own principle, and hostname produces junk names besides. The os
+//   import is deleted with it. Virgin installs now fall through to
+//   Rung 2 with an EMPTY candidate list: the human declares the id
+//   via the certification surface; the writer stays dark until then.
+//
+// The ladder as it now stands (designed 2026-10-23, shipped 0.1.1):
 //
 //   Rung 1  origin.txt in the plugin folder. A non-canonical file, so
 //           Obsidian Sync structurally excludes it from ferrying;
 //           BRAT updates touch only the canonical quartet, so it
 //           survives releases. If present, that's the origin, period.
-//   Rung 2  No origin.txt + shards exist => the writer stays DARK. The
-//           settings surface lists the found shards and demands HUMAN
-//           certification (continue an existing shard or type a new
-//           id). No machine ever infers identity from ferried state.
-//           Certification is logged as origin.migrated-interim.
-//   Rung 3  No origin.txt + no shards (virgin install) => os.hostname()
-//           seeds a default, overridable. (Spike-verified in the
-//           renderer 2026-10-23.)
+//   Rung 2  No origin.txt => the writer stays DARK, whether shards
+//           exist or not. The settings surface lists any found shards
+//           and demands HUMAN certification (continue an existing
+//           shard or declare a new id; a virgin install simply gets
+//           an empty candidate list). No machine ever infers identity
+//           from ferried state or from the OS. Certification is
+//           logged as origin.migrated-interim.
 //   Rung 4  data.json's origin field is NEVER read again. If present
 //           it is scrubbed on load and the scrub is logged as a
 //           settings.changed-interim event. It is NOT a migration
 //           source — auto-lifting it gambles on a sync-conflict coin
 //           toss.
 //
+// 0.1.2 — DWELL-GATE WIRING (v1, threshold-only):
+//
+//   note.opened fires when a note's accrued dwell crosses the 10s gate.
+//   v1 semantics, ratified 2026-10-23 (Dan):
+//     - Threshold-only emission: no note-close event listening (the
+//       Obsidian close path is messy; the gate alone filters noise).
+//     - Flat exposure weight 1; the gate suppresses noise, it does
+//       not grade heat.
+//     - Dwell ACCUMULATES across separate openings of the same note
+//       within a session: abandon at 8s, return later, the timer arms
+//       for the remaining 2s. Multiple openings reaching a combined
+//       threshold fire one event.
+//     - One event per gate crossing; emission resets that note's
+//       accrual. Continued dwelling after an emission banks toward
+//       the farewell flush only.
+//     - Farewell (onunload): the gate applies at session end too —
+//       dwell below 10s emits NOTHING (per Fixture Corpus F09;
+//       ratified 2026-10-23). Dwell events are enqueued before
+//       dispose() so the serialized write queue flushes them ahead
+//       of the farewell drain.
+//   v1 limitations (declared, not hidden):
+//     - Threshold emissions carry dwell=10 flat; richer dwell values
+//       belong to a close-emit world this version does not build.
+//     - Dwell banked while the writer is dark (Rung 2 pending,
+//       foreign-origin block) is lost.
+//     - The accrual map is session-scoped, one entry per distinct
+//       note opened; no persistence across reloads.
+//
+//   API receipt: on('file-open', (file: TFile | null) => any, ctx?)
+//   — obsidian.d.ts l.11041. Verified 2026-10-23.
+//
+// 0.1.2 — CHAIN-VERIFICATION REPORT FOLD (ratified 2026-10-23):
+//
+//   The 0.1.1 startWriter ran verifyChain once inside a try/catch but
+//   recorded the failure in a SEPARATE trailing block that re-ran
+//   verifyChain unguarded. Defects: two full shard reads per boot;
+//   notice and ledger could disagree (the reads sandwich this
+//   plugin's own Tier-1 appends, plus Sync's mid-flight arrivals);
+//   the throw path double-reported with different wording; and the
+//   unguarded second call could throw past onload, killing the
+//   session.opened-interim beacon — the integrity recorder silencing
+//   the session record. Fold: ONE read, ONE report, one channel.
+//
 // Consequence: data.json carries shared knobs only. Per-device state
 // lives in sync-excluded lanes (origin.txt) or it isn't safe.
 // =============================================================================
-
-const os = require('os');
 
 import {
     App,
@@ -40,6 +90,7 @@ import {
     Plugin,
     PluginSettingTab,
     Setting,
+    TFile,
     normalizePath,
 } from 'obsidian';
 
@@ -53,6 +104,13 @@ import { verifyChain } from './eventlog/checkpoint.ts';
 
 const EVENTS_DIR = '_vault-index/events';
 const ORIGIN_FILE = 'origin.txt';
+
+// Dwell gate — 10s minimum before a note.opened emission. The value is
+// a v1 constant; promoting it to a shared data.json knob is future
+// icing (it only tunes behavior — the moment a setting changes WHAT
+// gets logged, it moves to sync-excluded lanes).
+const DWELL_GATE_S = 10;
+const DWELL_GATE_MS = DWELL_GATE_S * 1000;
 
 // -----------------------------------------------------------------------------
 // Settings — shared knobs ONLY (data.json rides Sync; identity does not)
@@ -137,7 +195,7 @@ async function sha256Hex(text: string, len = 16): Promise<string> {
 }
 
 // -----------------------------------------------------------------------------
-// Origin resolution — the 0.1.1 ladder
+// Origin resolution — the ladder
 // -----------------------------------------------------------------------------
 
 interface OriginResolution {
@@ -176,7 +234,7 @@ async function resolveOrigin(
             };
         }
         // An EMPTY origin.txt is a dead lane, not a Rung-1 hit. Fall
-        // through to Rungs 2/3 — an empty file certifies nothing.
+        // through to Rung 2 — an empty file certifies nothing.
     }
 
     // Rung 2 evidence: what shards exist? Ferried identity is not
@@ -191,33 +249,25 @@ async function resolveOrigin(
     .map((n) => n.replace(/\.jsonl$/, ''))
     .sort();
 
-    // Rung 2: shards exist, no origin.txt => human must certify. The
-    // plugin cannot know which shard (if any) belongs to this machine,
-    // and guessing is the flaw being fixed. Writer stays dark until
-    // certified via the settings surface.
-    if (foundOrigins.length > 0) {
-        return {
-            origin: null,
-            foundShards,
-            foundOrigins,
-            fromOriginFile: false,
-        };
-    }
-
-    // Rung 3: virgin install — hostname seeds a default, overridable.
-    // (os.hostname() spike-verified in the renderer 2026-10-23.)
+    // Rung 2 — covers BOTH cases since 0.1.2 deleted Rung 3:
+    //   shards exist => list them as certification candidates
+    //   no shards (virgin install) => empty candidate list
+    // Either way the human certifies; the machine never infers
+    // identity from ferried state or from the OS. The writer stays
+    // dark until certification happens via the settings surface.
     return {
-        origin: os.hostname(),
-        foundShards: [],
-        foundOrigins: [],
+        origin: null,
+        foundShards,
+        foundOrigins,
         fromOriginFile: false,
     };
 }
 
 /**
- * Rung completion for Rungs 2 and 3: persist the certified/chosen id to
- * origin.txt, creating the sync-excluded identity lane. Called only from
- * the certification surface (Rung 2) and first-boot seed (Rung 3).
+ * Rung 2 completion: persist the certified/chosen id to origin.txt,
+ * creating the sync-excluded identity lane. Called only from the
+ * certification surface (Rung 2) — the only path that creates
+ * origin.txt, since Rung 3 was deleted in 0.1.2.
  */
 async function writeOriginFile(
     adapter: VaultLogAdapter,
@@ -240,7 +290,10 @@ export default class VaultOverseerIndex extends Plugin {
     /** The resolved machine identity — never sourced from data.json. */
     originId: string | null = null;
 
-    /** Rung 2 pending: shard names awaiting human certification. */
+    /**
+     * Rung 2 pending: origin ids awaiting human certification. Empty
+     * (but non-null) for a virgin install — no shards, no candidates.
+     */
     pendingCertification: string[] | null = null;
 
     /** True after onload when the foreign-origin guard fired — writer refused. */
@@ -261,6 +314,22 @@ export default class VaultOverseerIndex extends Plugin {
      */
     private scrubbedLegacyOrigin: string | null = null;
 
+    // --- Dwell-gate state (v1 threshold-only) ---
+
+    /** The note the user most recently opened, and when. */
+    private activeNote: { path: string; openAt: number } | null = null;
+
+    /**
+     * Accrued dwell per path (ms) since that note's last note.opened
+     * emission — or since first open, if it never emitted. This is the
+     * accumulation lane: dwell banks across separate openings of the
+     * same note within a session.
+     */
+    private readonly dwellAccrued = new Map<string, number>();
+
+    /** Pending threshold timer for the active note. */
+    private dwellTimer: ReturnType<typeof setTimeout> | null = null;
+
     async onload(): Promise<void> {
         await this.loadSettings();
 
@@ -275,26 +344,112 @@ export default class VaultOverseerIndex extends Plugin {
         const resolution = await resolveOrigin(adapter, pluginFolder);
 
         if (resolution.origin === null) {
-            // Rung 2: shards exist, no origin.txt. Writer stays DARK —
-            // no EventLog is constructed, so no shard is touched while
-            // identity is uncertified. Certification surface lives in
-            // the settings tab (also reachable immediately).
+            // Rung 2: no origin.txt — shards may or may not exist. Writer
+            // stays DARK — no EventLog is constructed, so no shard is
+            // touched while identity is uncertified. Certification
+            // surface lives in the settings tab (also reachable
+            // immediately).
             this.pendingCertification = resolution.foundOrigins;
             new Notice(
-                'Vault Overseer: no origin.txt and shards exist — open ' +
-                'Settings → Vault Overseer to certify this machine\'s identity.',
+                'Vault Overseer: no origin.txt — open Settings → Vault ' +
+                'Overseer to certify this machine\'s identity.',
                 15000,
             );
         } else {
             await this.startWriter(adapter, resolution.origin, resolution.fromOriginFile);
         }
 
+        // Dwell-gate wiring. registerEvent cleans up automatically on
+        // unload — no manual offref bookkeeping. Tracked even while the
+        // writer is dark; emissions are simply dropped until the writer
+        // exists (declared v1 limitation).
+        this.registerEvent(
+            this.app.workspace.on('file-open', (file) => this.onFileOpen(file)),
+        );
+
         this.addSettingTab(new OverseerSettingTab(this.app, this));
     }
 
+    // ---------------------------------------------------------------------------
+    // Dwell-gate internals (v1 threshold-only)
+    // ---------------------------------------------------------------------------
+
+    /**
+     * file-open receipt (obsidian.d.ts l.11041): callback receives the
+     * newly opened TFile, or null when no file is open. Switching notes
+     * banks the outgoing note's dwell WITHOUT emitting — the gate, not
+     * abandonment, is what earns an event.
+     */
+    private onFileOpen(file: TFile | null): void {
+        const now = Date.now();
+
+        if (this.activeNote !== null) {
+            this.bankDwell(this.activeNote, now);
+            this.activeNote = null;
+        }
+        if (this.dwellTimer !== null) {
+            clearTimeout(this.dwellTimer);
+            this.dwellTimer = null;
+        }
+
+        if (file === null) return; // empty workspace / no file open
+        this.activeNote = { path: file.path, openAt: now };
+        this.armDwellTimer(file.path);
+    }
+
+    /** Add the active note's elapsed dwell to its accrual lane. */
+    private bankDwell(note: { path: string; openAt: number }, now: number): void {
+        const elapsed = now - note.openAt;
+        this.dwellAccrued.set(note.path, (this.dwellAccrued.get(note.path) ?? 0) + elapsed);
+    }
+
+    /**
+     * Arm the threshold timer for the given remaining dwell: the gate
+     * minus whatever this note has already banked this session.
+     */
+    private armDwellTimer(path: string): void {
+        const accrued = this.dwellAccrued.get(path) ?? 0;
+        const remaining = DWELL_GATE_MS - accrued;
+        if (remaining <= 0) {
+            // Accrued already crossed the gate without an intervening
+            // emission. Unreachable in normal flow (emission resets the
+            // accrual); emit immediately rather than spin.
+            this.onDwellGateCrossed(path);
+            return;
+        }
+        this.dwellTimer = setTimeout(() => {
+            this.onDwellGateCrossed(path);
+        }, remaining);
+    }
+
+    /**
+     * The gate was crossed: emit one note.opened (dwell=10 flat, v1),
+     * then reset that note's accrual. Continued dwelling after the
+     * emission banks toward the farewell flush only — one event per
+     * gate crossing, per the ratified semantics.
+     */
+    private onDwellGateCrossed(path: string): void {
+        this.dwellTimer = null;
+        this.dwellAccrued.set(path, 0);
+        if (this.activeNote !== null && this.activeNote.path === path) {
+            this.activeNote.openAt = Date.now(); // fresh baseline post-emission
+        }
+        void this.emitDwell(path, DWELL_GATE_S);
+    }
+
+    /** Tier-2 append through the writer's public API. Drops silently while dark. */
+    private async emitDwell(path: string, dwell: number): Promise<void> {
+        if (this.log === null) return; // writer dark: Rung 2 pending or foreign-origin
+        await this.log.appendEvent('user', 'note.opened', { path, dwell });
+    }
+
+    // ---------------------------------------------------------------------------
+    // Writer boot
+    // ---------------------------------------------------------------------------
+
     /**
      * Construct the writer, run startup checks + chain verification,
-     * and emit the session-opened beacon. Shared by the Rung-1/3 onload
+     * and emit the session-opened beacon. Shared by the Rung-1 onload
      * path and the Rung-2 certification path.
      */
     private async startWriter(
@@ -327,13 +482,16 @@ export default class VaultOverseerIndex extends Plugin {
         });
 
         // Deferred integrity bookkeeping that needed a writer to exist:
-        // (a) Rung 2/3 birth: origin.txt was created this boot — say so.
+        // (a) Rung 2 birth: origin.txt was written by the certification
+        //     surface this boot — say so, naming the mechanism. (Since
+        //     0.1.2 this is the ONLY path with fromOriginFile=false;
+        //     Rung 3 and its hostname seed are gone.)
         // (b) Rung 4: data.json carried a legacy origin field — record
         //     the scrub. Silent scrubs are disqualifying.
         if (!fromOriginFile) {
             await this.log.reportIntegrity(
                 `origin.migrated-interim: origin.txt created with id='${origin}' ` +
-                '(hostname-seeded virgin install or human certification)',
+                'via human certification (settings surface)',
             );
         }
         if (this.scrubbedLegacyOrigin !== null) {
@@ -344,36 +502,39 @@ export default class VaultOverseerIndex extends Plugin {
             this.scrubbedLegacyOrigin = null;
         }
 
-        const shardPath = `${EVENTS_DIR}/${origin}.jsonl`;
+        // -----------------------------------------------------------------
+        // Chain verification — ONE read, ONE report, one channel (fold
+        // ratified 2026-10-23; see header). The detail string is computed
+        // once and drives console, Notice, and ledger identically, so
+        // they can never disagree. The throw path is folded into the
+        // same channel — no separate wording, no second event, and no
+        // unguarded re-entry past onload that could kill the
+        // session.opened beacon below.
+        // -----------------------------------------------------------------
+        let chainDetail: string | null = null;
         try {
-            const chain = await verifyChain(adapter, shardPath, origin);
+            const chain = await verifyChain(adapter, `${EVENTS_DIR}/${origin}.jsonl`, origin);
             if (!chain.valid) {
-                this.chainBroken = true;
-                const detail = chain.detail ?? 'unknown chain failure';
-                console.error('[vault-overseer] chain verification FAILED:', detail);
-                new Notice(
-                    `Vault Overseer: checkpoint chain verification FAILED for '${origin}' ` +
-                    '— shard integrity is compromised. Details recorded in the event log.',
-                    15000,
-                );
+                chainDetail = chain.detail ?? 'unknown chain failure';
             }
         } catch (err) {
+            chainDetail =
+            `chain verification threw: ${err instanceof Error ? err.message : String(err)}`;
+        }
+        if (chainDetail !== null) {
             this.chainBroken = true;
-            const detail = err instanceof Error ? err.message : String(err);
-            console.error('[vault-overseer] chain verification threw:', detail);
-            await this.log.reportIntegrity(`chain verification threw: ${detail}`);
+            console.error('[vault-overseer] chain verification FAILED:', chainDetail);
+            new Notice(
+                `Vault Overseer: checkpoint chain verification FAILED for '${origin}' ` +
+                '— shard integrity is compromised. Details recorded in the event log.',
+                15000,
+            );
+            await this.log.reportIntegrity(`chain verification failed: ${chainDetail}`);
         }
 
         if (startup.integrity.length > 0) {
             await this.log.reportIntegrity(
                 startup.integrity.map((r) => r.detail).join('; '),
-            );
-        }
-
-        if (this.chainBroken) {
-            const chain = await verifyChain(adapter, shardPath, origin);
-            await this.log.reportIntegrity(
-                `chain verification failed: ${chain.detail ?? 'unknown chain failure'}`,
             );
         }
 
@@ -383,7 +544,37 @@ export default class VaultOverseerIndex extends Plugin {
         );
     }
 
+    /**
+     * SYNCHRONOUS, and the order below is load-bearing: farewell dwell
+     * events are APPENDED (into the serialized write queue) before
+     * dispose() is called, so the queue flushes them ahead of the
+     * farewell drain. The serialized queue makes the race impossible;
+     * this ordering is why dispose() sees them.
+     *
+     * Farewell gate ruling (v1, per F09, ratified): dwell below 10s
+     * emits NOTHING at session end — a swipe-through doesn't become
+     * signal just because Obsidian was closing.
+     */
     onunload(): void {
+        // Bank the active note's dwell up to this instant.
+        if (this.activeNote !== null) {
+            this.bankDwell(this.activeNote, Date.now());
+            this.activeNote = null;
+        }
+        if (this.dwellTimer !== null) {
+            clearTimeout(this.dwellTimer);
+            this.dwellTimer = null;
+        }
+
+        // Farewell flush: over-gate accruals only. Emits with actual
+        // dwell-so-far (floor seconds), which may exceed 10.
+        for (const [path, accrued] of this.dwellAccrued) {
+            if (accrued >= DWELL_GATE_MS) {
+                void this.emitDwell(path, Math.floor(accrued / 1000));
+            }
+        }
+        this.dwellAccrued.clear();
+
         void this.log?.dispose();
         this.log = null;
     }
@@ -445,7 +636,7 @@ export default class VaultOverseerIndex extends Plugin {
     /**
      * Rung 2 completion: human-certify this machine against an existing
      * shard (or a brand-new id). Writes origin.txt, then boots the writer
-     * through the same startWriter() path the automatic rungs use.
+     * through the same startWriter() path the Rung-1 path uses.
      */
     async certifyOrigin(origin: string): Promise<void> {
         const trimmed = origin.trim();
@@ -503,10 +694,10 @@ class OverseerSettingTab extends PluginSettingTab {
             containerEl.createEl('h3', { text: 'Certify this machine\'s identity' });
             containerEl.createEl('p', {
                 text:
-                'Shards exist in this vault but this machine has no origin.txt. ' +
-                'Identity cannot be inferred from synced state — pick which shard ' +
-                'this machine writes, or declare a new device id. Nothing is ' +
-                'appended until this is answered.',
+                'This machine has no origin.txt — identity cannot be inferred ' +
+                'from synced state or from the OS. Pick which shard this machine ' +
+                'writes, or declare a new device id (a virgin install offers only ' +
+                'the new-id option). Nothing is appended until this is answered.',
                 cls: 'mod-info',
             });
 
