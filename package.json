@@ -1,6 +1,6 @@
 {
   "name": "vault-overseer-index",
-  "version": "0.1.0",
+  "version": "0.1.4",
   "description": "Vault Overseer — Plugin 1: event-log spine and indexer",
   "main": "main.js",
   "type": "module",

@@ -666,11 +666,153 @@ async function healScan(log, source, eventsDir) {
   return result;
 }
 
+// src/dwell/gate.ts
+var DwellGate = class {
+  gateMs;
+  gateSeconds;
+  now;
+  schedule;
+  emit;
+  activeNote = null;
+  /**
+   * Banked dwell per noteId, with last-known path. Session-scoped,
+   * never persisted. Path refreshes on every open of that note, so
+   * farewell emissions name where the note was LAST seen — F05's
+   * rename wiring will supersede this convention properly.
+   */
+  lanes = /* @__PURE__ */ new Map();
+  /**
+   * noteIds that have crossed the gate this session. Survives the
+   * activeNote lifecycle (the note may be switched away and back);
+   * presence here suppresses timer re-arming for that note for the
+   * rest of the session.
+   */
+  crossedThisSession = /* @__PURE__ */ new Set();
+  timer = null;
+  constructor(opts) {
+    this.gateMs = opts.gateMs ?? 1e4;
+    this.gateSeconds = Math.floor(this.gateMs / 1e3);
+    this.now = opts.now ?? Date.now;
+    this.schedule = opts.schedule ?? ((cb, ms) => {
+      const t = setTimeout(() => cb(), ms);
+      return { cancel: () => clearTimeout(t) };
+    });
+    this.emit = opts.emit;
+  }
+  // ---------------------------------------------------------------------------
+  // Public surface — mirrors the plugin's actual events
+  // ---------------------------------------------------------------------------
+  /**
+   * A file was opened. Banks the outgoing note's dwell (if any) into
+   * its lane, cancels any pending timer, and arms a fresh timer for
+   * the incoming note — unless that note has already crossed this
+   * session, in which case its dwell simply banks.
+   */
+  open(noteId, path) {
+    const now = this.now();
+    this.bankActive(now);
+    this.clearTimer();
+    const emitted = this.crossedThisSession.has(noteId);
+    this.activeNote = { noteId, path, openAt: now, emitted };
+    const lane = this.lanes.get(noteId);
+    if (lane !== void 0) lane.path = path;
+    if (emitted) return;
+    const banked = this.lanes.get(noteId)?.ms ?? 0;
+    const remaining = this.gateMs - banked;
+    if (remaining <= 0) {
+      void this.fire();
+      return;
+    }
+    this.armTimer(remaining);
+  }
+  /** file-open fired with null: the workspace holds no file. Bank, stand down. */
+  noFileOpen() {
+    this.bankActive(this.now());
+    this.clearTimer();
+  }
+  /**
+   * Session end. Banks the active note, cancels any pending timer, and
+   * RETURNS the over-gate accruals (actual dwell-so-far since the last
+   * emission, floor seconds, with each lane's last-known path) for the
+   * caller to emit before dispose(). Under-gate accruals are discarded
+   * — silence is the v1 ruling. Clears all lanes.
+   */
+  sessionEnd() {
+    this.bankActive(this.now());
+    this.clearTimer();
+    const farewells = [];
+    for (const lane of this.lanes.values()) {
+      if (lane.ms >= this.gateMs) {
+        farewells.push({
+          path: lane.path,
+          dwellSeconds: Math.floor(lane.ms / 1e3)
+        });
+      }
+    }
+    this.lanes.clear();
+    this.crossedThisSession.clear();
+    return farewells;
+  }
+  // ---------------------------------------------------------------------------
+  // Internals
+  // ---------------------------------------------------------------------------
+  /** Add the active note's elapsed dwell to its lane, then drop it. */
+  bankActive(now) {
+    if (this.activeNote === null) return;
+    const elapsed = now - this.activeNote.openAt;
+    if (elapsed > 0) {
+      const existing = this.lanes.get(this.activeNote.noteId);
+      if (existing !== void 0) {
+        existing.path = this.activeNote.path;
+        existing.ms += elapsed;
+      } else {
+        this.lanes.set(this.activeNote.noteId, {
+          path: this.activeNote.path,
+          ms: elapsed
+        });
+      }
+    }
+    this.activeNote = null;
+  }
+  clearTimer() {
+    if (this.timer !== null) {
+      this.timer.cancel();
+      this.timer = null;
+    }
+  }
+  armTimer(remainingMs) {
+    const note = this.activeNote;
+    if (note === null) return;
+    this.timer = this.schedule(() => {
+      this.timer = null;
+      void this.fire();
+    }, remainingMs);
+  }
+  /**
+   * The gate crossing. Emits flat gate seconds, resets the accrual,
+   * rebaselines openAt, and marks the note crossed — its continued
+   * dwell now banks toward the farewell flush only.
+   *
+   * Defensive: a late timer firing after the note switched away is
+   * ignored (open/noFileOpen cancel the timer, but belt and braces —
+   * a fire with no active note, or for a note already emitted, is a
+   * no-op, never an orphan emission).
+   */
+  async fire() {
+    const note = this.activeNote;
+    if (note === null || note.emitted) return;
+    this.clearTimer();
+    note.emitted = true;
+    this.crossedThisSession.add(note.noteId);
+    this.lanes.set(note.noteId, { path: note.path, ms: 0 });
+    note.openAt = this.now();
+    await this.emit(note.path, this.gateSeconds);
+  }
+};
+
 // src/main.ts
 var EVENTS_DIR = "_vault-index/events";
 var ORIGIN_FILE = "origin.txt";
-var DWELL_GATE_S = 10;
-var DWELL_GATE_MS = DWELL_GATE_S * 1e3;
 var DEFAULT_SETTINGS = {};
 var VaultLogAdapter = class {
   constructor(inner) {
@@ -771,18 +913,27 @@ var VaultOverseerIndex = class extends import_obsidian.Plugin {
    * scrub is never silent.
    */
   scrubbedLegacyOrigin = null;
-  // --- Dwell-gate state (v1 threshold-only) ---
-  /** The note the user most recently opened, and when. */
-  activeNote = null;
+  // --- Dwell-gate adapter state (semantics live in src/dwell/gate.ts) ---
   /**
-   * Accrued dwell per path (ms) since that note's last note.opened
-   * emission — or since first open, if it never emitted. This is the
-   * accumulation lane: dwell banks across separate openings of the
-   * same note within a session.
+   * The pure gate, wired to this plugin's writer. Field initializer
+   * is safe: the emit closure captures `this` lazily, so the gate
+   * exists before onload but cannot emit into a dark writer.
    */
-  dwellAccrued = /* @__PURE__ */ new Map();
-  /** Pending threshold timer for the active note. */
-  dwellTimer = null;
+  dwellGate = new DwellGate({
+    emit: (path, dwell) => this.emitDwell(path, dwell)
+  });
+  /** Sequential counter backing the TFile→noteId map. */
+  noteIdCounter = 0;
+  /**
+   * Opaque note-id per TFile (collision fix, 2026-10-24). Obsidian
+   * reuses `Notes/Untitled.md` across successive creations; keying
+   * accrual by PATH let a new creation inherit a dead predecessor's
+   * banked dwell. WeakMap<TFile, string> gives every distinct file
+   * object its own id for the session — same path, different note,
+   * different lane. The map itself is session-scoped and garbage
+   * collects with the TFiles.
+   */
+  noteIdMap = /* @__PURE__ */ new WeakMap();
   async onload() {
     await this.loadSettings();
     const adapter = new VaultLogAdapter(this.app.vault.adapter);
@@ -803,63 +954,40 @@ var VaultOverseerIndex = class extends import_obsidian.Plugin {
     this.addSettingTab(new OverseerSettingTab(this.app, this));
   }
   // ---------------------------------------------------------------------------
-  // Dwell-gate internals (v1 threshold-only)
+  // Dwell-gate adapter (thin wiring; semantics in src/dwell/gate.ts)
   // ---------------------------------------------------------------------------
   /**
    * file-open receipt (obsidian.d.ts l.11041): callback receives the
-   * newly opened TFile, or null when no file is open. Switching notes
-   * banks the outgoing note's dwell WITHOUT emitting — the gate, not
-   * abandonment, is what earns an event.
+   * newly opened TFile, or null when no file is open. Null routes to
+   * the gate's noFileOpen (banks outgoing dwell without emitting).
    */
   onFileOpen(file) {
-    const now = Date.now();
-    if (this.activeNote !== null) {
-      this.bankDwell(this.activeNote, now);
-      this.activeNote = null;
-    }
-    if (this.dwellTimer !== null) {
-      clearTimeout(this.dwellTimer);
-      this.dwellTimer = null;
-    }
-    if (file === null) return;
-    this.activeNote = { path: file.path, openAt: now };
-    this.armDwellTimer(file.path);
-  }
-  /** Add the active note's elapsed dwell to its accrual lane. */
-  bankDwell(note, now) {
-    const elapsed = now - note.openAt;
-    this.dwellAccrued.set(note.path, (this.dwellAccrued.get(note.path) ?? 0) + elapsed);
-  }
-  /**
-   * Arm the threshold timer for the given remaining dwell: the gate
-   * minus whatever this note has already banked this session.
-   */
-  armDwellTimer(path) {
-    const accrued = this.dwellAccrued.get(path) ?? 0;
-    const remaining = DWELL_GATE_MS - accrued;
-    if (remaining <= 0) {
-      this.onDwellGateCrossed(path);
+    if (file === null) {
+      this.dwellGate.noFileOpen();
       return;
     }
-    this.dwellTimer = setTimeout(() => {
-      this.onDwellGateCrossed(path);
-    }, remaining);
+    this.dwellGate.open(this.getNoteId(file), file.path);
   }
   /**
-   * The gate was crossed: emit one note.opened (dwell=10 flat, v1),
-   * then reset that note's accrual. Continued dwelling after the
-   * emission banks toward the farewell flush only — one event per
-   * gate crossing, per the ratified semantics.
+   * Opaque note-id from TFile identity. First sighting assigns a fresh
+   * id; every subsequent open of the SAME file object reuses it, so
+   * dwell accumulates across openings of one note while distinct
+   * creations of the same path never share a lane.
    */
-  onDwellGateCrossed(path) {
-    this.dwellTimer = null;
-    this.dwellAccrued.set(path, 0);
-    if (this.activeNote !== null && this.activeNote.path === path) {
-      this.activeNote.openAt = Date.now();
+  getNoteId(file) {
+    let id = this.noteIdMap.get(file);
+    if (id === void 0) {
+      id = `note-${++this.noteIdCounter}`;
+      this.noteIdMap.set(file, id);
     }
-    void this.emitDwell(path, DWELL_GATE_S);
+    return id;
   }
-  /** Tier-2 append through the writer's public API. Drops silently while dark. */
+  /**
+   * Tier-2 append through the writer's public API. Drops silently
+   * while dark — declared v1 limitation. Fire-and-forget at the call
+   * site: the writer's serialized queue orders the write; the gate's
+   * callback does not need to await it to preserve ordering.
+   */
   async emitDwell(path, dwell) {
     if (this.log === null) return;
     await this.log.appendEvent("user", "note.opened", { path, dwell });
@@ -950,20 +1078,10 @@ var VaultOverseerIndex = class extends import_obsidian.Plugin {
    * signal just because Obsidian was closing.
    */
   onunload() {
-    if (this.activeNote !== null) {
-      this.bankDwell(this.activeNote, Date.now());
-      this.activeNote = null;
+    const farewells = this.dwellGate.sessionEnd();
+    for (const f of farewells) {
+      void this.emitDwell(f.path, f.dwellSeconds);
     }
-    if (this.dwellTimer !== null) {
-      clearTimeout(this.dwellTimer);
-      this.dwellTimer = null;
-    }
-    for (const [path, accrued] of this.dwellAccrued) {
-      if (accrued >= DWELL_GATE_MS) {
-        void this.emitDwell(path, Math.floor(accrued / 1e3));
-      }
-    }
-    this.dwellAccrued.clear();
     void this.log?.dispose();
     this.log = null;
   }
