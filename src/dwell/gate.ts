@@ -7,10 +7,9 @@
 // wiring; the spine's semantics live in modules"). Observable clock and
 // timer are injected (same seam shape as EventLog's `now?: () => string`),
 // and emission rides a callback, so the gate runs in plain Node under
-// F09 with zero Obsidian runtime and zero internal mocking.
+// F09/F05 with zero Obsidian runtime and zero internal mocking.
 //
-// v1 SEMANTICS (ratified 2026-10-23, carried verbatim from 0.1.2's
-// in-plugin implementation):
+// v1 SEMANTICS (ratified 2026-10-23, carried verbatim):
 //   - Threshold-only emission: the gate fires when a note's accrued
 //     dwell crosses gateMs (default 10s). Threshold emissions carry
 //     dwell = gate/1000 FLAT — richer values belong to a close-emit
@@ -40,10 +39,47 @@
 // predecessor's banked dwell and fire early (live-observed 2026-10-23).
 // Distinct ids never share a lane, whatever their paths.
 //
-// DECLARED, NOT FIXED HERE: placeholder-path emissions. file-open fires
-// on note CREATE before the title is typed, so a threshold emission can
-// permanently record `Notes/Untitled.md` — renames are not wired. F05
-// owns that fix; F09 asserts the collision fix only.
+// RENAME WIRING (F05a, 2026-10-24) — two methods, one doctrine:
+//   - renamePath(from, to): a FILE was renamed. Rewrites the note's
+//     last-known path in the active note and every accrual lane, so
+//     future emissions name where the note IS.
+//   - renamePrefix(from, to): a FOLDER was renamed. Prefix-rewrites
+//     every known path under from/ to to/ — a folder rename
+//     invalidates the disk location of everything it contains (notes,
+//     attachments, embeds; linked or not), so any path the gate holds
+//     beneath the old prefix is instantly stale and is rewritten here.
+//   Matching is by path string — exact for files, prefix+'/' for
+//   folders — safe because paths are unique among live files at any
+//   instant, and a folder rename re-addresses its whole subtree at
+//   once with no collisions (the vault guarantees disjoint new paths).
+//   History is NOT rewritten and must never be — emissions already on
+//   the spine keep their old paths forever (append-only doctrine);
+//   note.renamed / folder.renamed events carry the chain, and the
+//   projection resolves it.
+//
+// ONTOLOGY NOTE (ratified 2026-10-24): folders are administrative
+// grouping (PARA etc.), not the organic organization — notes link
+// across folders freely, and the link graph (the index's province)
+// is unaffected by any rename. Paths are storage addresses. The gate
+// tracks them only so emissions name a live address.
+//
+// RULING SUPERSESSION (2026-10-24, logged not hidden): this header
+// earlier ruled "folder renames are not our event." Superseded for
+// the GATE unconditionally (paths must stay truthful — hence
+// renamePrefix). The SPINE-level folder.renamed event is pending a
+// types.ts ruling + paste: stock Obsidian emits no child-path events
+// and only maintains links, so a folder rename is a mass-invalidation
+// fact the index must learn the moment it happens — but transcribing
+// a new event type is the owner's doctrine to satisfy. Until ruled,
+// main.ts's TFolder branch rewrites gate prefixes and emits nothing.
+//
+// DECLARED, NOT FIXED HERE: the placeholder-path EMISSION itself.
+// file-open fires on note CREATE before the title is typed, so an
+// emission that crosses BEFORE the user types the title still records
+// Notes/Untitled.md — but note.renamed now sits beside it on the
+// spine, so the record is correctable by the projection. The
+// uncorrectable placeholder is dead; the correctable one is the
+// v1 behavior, and it is declared.
 //
 // Corrections log (self-caught, logged not hidden):
 //   Draft 1 (2026-10-24): sessionEnd() nulled the active note before
@@ -106,9 +142,9 @@ export class DwellGate {
 
     /**
      * Banked dwell per noteId, with last-known path. Session-scoped,
-     * never persisted. Path refreshes on every open of that note, so
-     * farewell emissions name where the note was LAST seen — F05's
-     * rename wiring will supersede this convention properly.
+     * never persisted. Path refreshes on every open of that note AND
+     * on renamePath/renamePrefix, so farewell emissions name where
+     * the note was LAST seen.
      */
     private readonly lanes = new Map<string, AccrualLane>();
 
@@ -175,6 +211,52 @@ export class DwellGate {
     noFileOpen(): void {
         this.bankActive(this.now());
         this.clearTimer();
+    }
+
+    /**
+     * A note was renamed (FILE rename; exact path match). Rewrites the
+     * note's last-known path in the active note and every accrual lane,
+     * so any threshold or farewell emission from here forward names
+     * where the note IS.
+     *
+     * A rename touching no known lane (fresh file, foreign path) is a
+     * harmless no-op.
+     */
+    renamePath(from: string, to: string): void {
+        if (this.activeNote !== null && this.activeNote.path === from) {
+            this.activeNote.path = to;
+        }
+        for (const lane of this.lanes.values()) {
+            if (lane.path === from) lane.path = to;
+        }
+    }
+
+    /**
+     * A folder was renamed (PREFIX rewrite). Every known path under
+     * `from/` is remapped to `to/...` — the active note and every
+     * accrual lane. A folder rename invalidates the storage address of
+     * everything beneath it; this keeps every path the gate holds
+     * truthful in the same instant, so emissions and farewells never
+     * name a dead address.
+     *
+     * Notes OUTSIDE the renamed prefix are untouched. A prefix touching
+     * no known paths is a harmless no-op.
+     */
+    renamePrefix(from: string, to: string): void {
+        const fromPrefix = from.endsWith('/') ? from : `${from}/`;
+        if (
+            this.activeNote !== null &&
+            this.activeNote.path.startsWith(fromPrefix)
+        ) {
+            this.activeNote.path =
+            to.replace(/\/+$/, '') + this.activeNote.path.slice(from.length);
+        }
+        for (const lane of this.lanes.values()) {
+            if (lane.path.startsWith(fromPrefix)) {
+                lane.path =
+                to.replace(/\/+$/, '') + lane.path.slice(from.length);
+            }
+        }
     }
 
     /**

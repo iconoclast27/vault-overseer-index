@@ -676,9 +676,9 @@ var DwellGate = class {
   activeNote = null;
   /**
    * Banked dwell per noteId, with last-known path. Session-scoped,
-   * never persisted. Path refreshes on every open of that note, so
-   * farewell emissions name where the note was LAST seen — F05's
-   * rename wiring will supersede this convention properly.
+   * never persisted. Path refreshes on every open of that note AND
+   * on renamePath/renamePrefix, so farewell emissions name where
+   * the note was LAST seen.
    */
   lanes = /* @__PURE__ */ new Map();
   /**
@@ -729,6 +729,45 @@ var DwellGate = class {
   noFileOpen() {
     this.bankActive(this.now());
     this.clearTimer();
+  }
+  /**
+   * A note was renamed (FILE rename; exact path match). Rewrites the
+   * note's last-known path in the active note and every accrual lane,
+   * so any threshold or farewell emission from here forward names
+   * where the note IS.
+   *
+   * A rename touching no known lane (fresh file, foreign path) is a
+   * harmless no-op.
+   */
+  renamePath(from, to) {
+    if (this.activeNote !== null && this.activeNote.path === from) {
+      this.activeNote.path = to;
+    }
+    for (const lane of this.lanes.values()) {
+      if (lane.path === from) lane.path = to;
+    }
+  }
+  /**
+   * A folder was renamed (PREFIX rewrite). Every known path under
+   * `from/` is remapped to `to/...` — the active note and every
+   * accrual lane. A folder rename invalidates the storage address of
+   * everything beneath it; this keeps every path the gate holds
+   * truthful in the same instant, so emissions and farewells never
+   * name a dead address.
+   *
+   * Notes OUTSIDE the renamed prefix are untouched. A prefix touching
+   * no known paths is a harmless no-op.
+   */
+  renamePrefix(from, to) {
+    const fromPrefix = from.endsWith("/") ? from : `${from}/`;
+    if (this.activeNote !== null && this.activeNote.path.startsWith(fromPrefix)) {
+      this.activeNote.path = to.replace(/\/+$/, "") + this.activeNote.path.slice(from.length);
+    }
+    for (const lane of this.lanes.values()) {
+      if (lane.path.startsWith(fromPrefix)) {
+        lane.path = to.replace(/\/+$/, "") + lane.path.slice(from.length);
+      }
+    }
   }
   /**
    * Session end. Banks the active note, cancels any pending timer, and
@@ -951,6 +990,9 @@ var VaultOverseerIndex = class extends import_obsidian.Plugin {
     this.registerEvent(
       this.app.workspace.on("file-open", (file) => this.onFileOpen(file))
     );
+    this.registerEvent(
+      this.app.vault.on("rename", (file, oldPath) => this.onVaultRename(file, oldPath))
+    );
     this.addSettingTab(new OverseerSettingTab(this.app, this));
   }
   // ---------------------------------------------------------------------------
@@ -991,6 +1033,36 @@ var VaultOverseerIndex = class extends import_obsidian.Plugin {
   async emitDwell(path, dwell) {
     if (this.log === null) return;
     await this.log.appendEvent("user", "note.opened", { path, dwell });
+  }
+  // ---------------------------------------------------------------------------
+  // Rename adapter (thin wiring; F05a, 2026-10-24)
+  // ---------------------------------------------------------------------------
+  /**
+   * Vault rename receipt (obsidian.d.ts l.10451): callback receives
+   * the renamed TAbstractFile plus its old path. Branches on which
+   * it got — file renames are our event (note.renamed, F05a); folder
+   * renames rewrite the gate's prefixes (mass invalidation of
+   * storage addresses; spine emission pending the types.ts ruling).
+   */
+  onVaultRename(file, oldPath) {
+    if (file instanceof import_obsidian.TFolder) {
+      this.dwellGate.renamePrefix(oldPath, file.path);
+      return;
+    }
+    this.dwellGate.renamePath(oldPath, file.path);
+    void this.emitRename(oldPath, file.path);
+  }
+  /**
+   * Tier-1 write-through for note.renamed (tier label corrected
+   * 2026-10-24: verified against TIER2_TYPES — the Tier-2 set holds
+   * note.opened/chunk.* only, so renames route write-through, loss
+   * on crash not tolerated, buffer carried ahead so disk order ==
+   * seq order). Drops silently while dark, same as every adapter
+   * emission.
+   */
+  async emitRename(from, to) {
+    if (this.log === null) return;
+    await this.log.appendEvent("user", "note.renamed", { from, to });
   }
   // ---------------------------------------------------------------------------
   // Writer boot

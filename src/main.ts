@@ -7,6 +7,47 @@
 // F03 heal scan, and expose the Plugin 2 seam. Everything here is wiring;
 // the spine's semantics live in src/eventlog/*.
 //
+// 0.1.5-bound — RENAME WIRING (F05a, ratified 2026-10-24):
+//
+//   The plugin's second vault event: 'rename' — vault.on('rename',
+//   (file: TAbstractFile, oldPath: string), obsidian.d.ts l.10451,
+//   verified 2026-10-24). The handler branches on which arrived:
+//
+//   - TFile   => note.renamed {from, to} through the writer (Tier-1
+//                write-through — renames are file facts, loss on
+//                crash is not tolerated. Verified against
+//                TIER2_TYPES 2026-10-24: the Tier-2 set contains
+//                note.opened/chunk.* only, so note.renamed routes
+//                write-through, with the Tier-2 buffer carried
+//                ahead of it so disk order == seq order. Actor
+//                'user' — the rename is the human's act, recorded
+//                by instrument). Drops while the writer is dark,
+//                like every adapter emission (declared v1
+//                limitation). The gate's lanes are rewritten in
+//                the same handler, so in-flight accrual and future
+//                emissions name the new path.
+//   - TFolder => gate.renamePrefix(oldPath, file.path): a folder
+//                rename mass-invalidates every storage address under
+//                it (notes, attachments, embeds; linked or not — links
+//                are maintained by Obsidian and unaffected). Spine
+//                emission (folder.renamed) is PENDING a types.ts
+//                ruling: a new event type transcribes only against
+//                its fixture-loaded consumer, and the index's
+//                subscriber seam is the committed future consumer.
+//                Until ruled, the branch rewrites gate prefixes and
+//                emits nothing.
+//
+//   OWNING WART KILLED: placeholder-path emissions are CORRECTABLE.
+//   file-open fires on note CREATE before the title is typed; an
+//   emission crossing before the rename still records
+//   Notes/Untitled.md, but note.renamed now sits beside it on the
+//   spine, so the projection resolves the chain. The uncorrectable
+//   placeholder is dead; the correctable one is declared v1 behavior.
+//
+//   Ontology ruling (2026-10-24): folders are administrative grouping
+//   (PARA); the organic organization is the LINK GRAPH, the index's
+//   province. Paths are storage addresses, not relationships.
+//
 // 0.1.4-bound — DWELL-GATE EXTRACTION (ratified 2026-10-24):
 //
 //   The dwell gate's semantics moved to src/dwell/gate.ts (pure module,
@@ -23,11 +64,10 @@
 //     2026-10-23, F09-family wart #2). Distinct TFiles now have
 //     distinct ids — no inheritance. F09 (src/fixtures/f09.ts) is
 //     the fixture earning this.
-//   - REMAINING DECLARED WART (not fixed here, F05's territory):
-//     placeholder-path emissions. file-open fires on note CREATE
-//     before the title is typed, so note.opened can permanently
-//     record `Notes/Untitled.md` — the real name never supersedes
-//     it until note.renamed is wired. Declared, not hidden.
+//   - REMAINING DECLARED WART (superseded by F05a, 2026-10-24, kept
+//     for the record): placeholder-path emissions were uncorrectable
+//     until note.renamed was wired. Now correctable — see the
+//     0.1.5-bound block above.
 //
 //   Farewell ordering doctrine, unchanged: onunload() is SYNCHRONOUS
 //   and enqueues farewell dwell events into the serialized write
@@ -114,8 +154,12 @@
 //     - Placeholder-path emissions remain until F05 rename wiring
 //       (note.renamed not yet listened for).
 //
-//   API receipt: on('file-open', (file: TFile | null) => any, ctx?)
+//   API receipts: on('file-open', (file: TFile | null) => any, ctx?)
 //   — obsidian.d.ts l.11041. Verified 2026-10-23.
+//   on('rename', (file: TAbstractFile, oldPath: string) => any, ctx?)
+//   — obsidian.d.ts l.10451. Verified 2026-10-24. TFolder instanceof
+//   disambiguates; folder renames arrive on the same event (no
+//   separate folder-rename hook exists).
 //
 // 0.1.2 — CHAIN-VERIFICATION REPORT FOLD (ratified 2026-10-23):
 //
@@ -139,7 +183,9 @@ import {
     Plugin,
     PluginSettingTab,
     Setting,
+    TAbstractFile,
     TFile,
+    TFolder,
     normalizePath,
 } from 'obsidian';
 
@@ -425,6 +471,14 @@ export default class VaultOverseerIndex extends Plugin {
             this.app.workspace.on('file-open', (file) => this.onFileOpen(file)),
         );
 
+        // Rename wiring (F05a, 2026-10-24). Same registerEvent doctrine:
+        // tracked even while the writer is dark; note.renamed drops
+        // silently (declared v1 limitation) while gate rewrites still
+        // happen — the gate's truth must not depend on the writer's mood.
+        this.registerEvent(
+            this.app.vault.on('rename', (file, oldPath) => this.onVaultRename(file, oldPath)),
+        );
+
         this.addSettingTab(new OverseerSettingTab(this.app, this));
     }
 
@@ -469,6 +523,46 @@ export default class VaultOverseerIndex extends Plugin {
     private async emitDwell(path: string, dwell: number): Promise<void> {
         if (this.log === null) return; // writer dark: Rung 2 pending or foreign-origin
         await this.log.appendEvent('user', 'note.opened', { path, dwell });
+    }
+
+    // ---------------------------------------------------------------------------
+    // Rename adapter (thin wiring; F05a, 2026-10-24)
+    // ---------------------------------------------------------------------------
+
+    /**
+     * Vault rename receipt (obsidian.d.ts l.10451): callback receives
+     * the renamed TAbstractFile plus its old path. Branches on which
+     * it got — file renames are our event (note.renamed, F05a); folder
+     * renames rewrite the gate's prefixes (mass invalidation of
+     * storage addresses; spine emission pending the types.ts ruling).
+     */
+    private onVaultRename(file: TAbstractFile, oldPath: string): void {
+        if (file instanceof TFolder) {
+            // Folder rename: every known path under oldPath/ is stale.
+            // Rewrite the gate's addresses; emit nothing yet (pending
+            // the folder.renamed transcription ruling).
+            this.dwellGate.renamePrefix(oldPath, file.path);
+            return;
+        }
+
+        // Gate first (synchronous, cheap): accrual truth never depends
+        // on the writer's mood. Then the spine fact, ordered by the
+        // serialized queue with everything else.
+        this.dwellGate.renamePath(oldPath, file.path);
+        void this.emitRename(oldPath, file.path);
+    }
+
+    /**
+     * Tier-1 write-through for note.renamed (tier label corrected
+     * 2026-10-24: verified against TIER2_TYPES — the Tier-2 set holds
+     * note.opened/chunk.* only, so renames route write-through, loss
+     * on crash not tolerated, buffer carried ahead so disk order ==
+     * seq order). Drops silently while dark, same as every adapter
+     * emission.
+     */
+    private async emitRename(from: string, to: string): Promise<void> {
+        if (this.log === null) return; // writer dark: Rung 2 pending or foreign-origin
+        await this.log.appendEvent('user', 'note.renamed', { from, to });
     }
 
     // ---------------------------------------------------------------------------

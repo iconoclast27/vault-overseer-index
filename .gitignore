@@ -1,7 +1,23 @@
+# Dependencies
 node_modules/
-dist/
-build/
-*.tsbuildinfo
-*.log
+
+# Build output (esbuild)
+main.js
+main.js.map
+styles.css
+
+# Event shards (your actual data)
+*.jsonl
+*/_vault-index/events/*.jsonl
+*.jsonl.lock
+
+# Test vaults (your personal content)
+_test_vault/
+test-vault/
+
+# Misc
 .DS_Store
-.env
+.vscode/
+.idea/
+*.swp
+*.swo
