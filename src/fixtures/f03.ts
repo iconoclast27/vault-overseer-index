@@ -2,6 +2,7 @@
 // Vault Overseer — Fixture F03: Mid-flush crash with live buffer
 // vault-overseer-index/src/fixtures/f03.ts
 // Generated: 2026-10-22T11:35:00+01:00
+// Rev B: 2026-10-25 — corpse suppression (delete/rename-away paths not re-chunked)
 //
 // Threat: Tier-2 buffer part-full at process death — the failure mode
 // the two-tier design PREDICTS, so it is tested harder than the
@@ -22,8 +23,15 @@
 //   gap-refusal — post-crash shard hand-corrupted with a seq gap:
 //                 healScan must REFUSE loudly (never-fabricate), emit
 //                 nothing, log.integrity names the gap.
+//   corpse-suppress — create Alpha/Beta/Delta, rename Alpha→Gamma,
+//                 delete Beta and Delta (rename-then-delete). Heals
+//                 examine ONLY Gamma; Alpha/Beta/Delta paths are
+//                 corpse-suppressed. The additive projection that
+//                 lacks subtractive semantics (deleted/renamed-from
+//                 don't subtract) will FAIL here — the red earning
+//                 the projection extraction.
 //
-// Pass requires (corpus F03):
+// Pass requires (corpus F03, rev B):
 //   1. Tier-1 facts present exactly once — facts survived, full stop
 //   2. The 40 Tier-2 events absent from disk at kill time
 //   3. Heal re-derives all 40, field-identical to the lost events
@@ -32,6 +40,9 @@
 //   5. Idempotence: second heal dedupes all 40 vh, emits zero
 //   6. P1: re-derived offsets reproduce their text (slice == vh)
 //   7. Clean crash: no torn tail, seq contiguous, gaps: []
+//   8. CORPSE SUPPRESSION (NEW): heal examines 1 path (Gamma), not 4;
+//      zero "file absent" for Alpha/Beta/Delta; no chunk.indexed
+//      for corpses; the live path's chunks index normally.
 //
 // The killed context's idle timer stays armed — spawned with a
 // geological tier2IdleMs (a Zone 3 tunable, so corpus rule 2 holds:
@@ -77,7 +88,7 @@ function splitByteLines(raw: Uint8Array): Uint8Array[] {
             start = i + 1;
         }
     }
-    if (start < raw.length) out.push(raw.slice(start));
+    if (start < raw.length) out.push(raw.slice(start, raw.length));
     return out;
 }
 
@@ -346,15 +357,104 @@ async function scenarioGapRefusal(): Promise<void> {
           parseEvents(rawAfter, 'chunk.indexed').length === 0);
 }
 
+// --- Scenario 4: corpse suppression — delete/rename-away paths not examined ---
+
+async function scenarioCorpseSuppress(): Promise<void> {
+    console.log('\n=== F03 scenario: corpse suppression (delete/renamed-away not examined) ===');
+    const fs = new FakeFileSystem();
+    const SHARD = shardPath(ROOT, ORIGIN);
+
+    // Build a spine with four paths:
+    //   Alpha created → renamed to Gamma (Alpha is corpse, Gamma is live)
+    //   Beta created → deleted (Beta is corpse)
+    //   Delta created → renamed to Epsilon → deleted (Delta is rename-victim, Epsilon is corpse)
+    //
+    // Disk has ONLY Gamma.md; Alpha/Beta/Delta/Epsilon are absent.
+    // The current additive projection (create adds, nothing subtracts)
+    // will examine all four and file "file absent" for the corpses.
+    // The live-set projection (deleted/renamed-from subtract) examines only Gamma.
+
+    // Append the lifecycle events
+    const ctx1 = spawnContext(ORIGIN, ROOT, {
+        fs, now: () => FIXED_TS, settings: { tier2IdleMs: GEOLOGICAL_IDLE_MS },
+    });
+
+    // create Alpha, Beta, Delta
+    await ctx1.log.appendEvent('user', 'note.created', {
+        path: 'Notes/Alpha.md', mtime: 1763000000000, bytes: 128, content_sha: 'aaa'
+    });
+    await ctx1.log.appendEvent('user', 'note.created', {
+        path: 'Notes/Beta.md', mtime: 1763000000001, bytes: 128, content_sha: 'bbb'
+    });
+    await ctx1.log.appendEvent('user', 'note.created', {
+        path: 'Notes/Delta.md', mtime: 1763000000002, bytes: 128, content_sha: 'ccc'
+    });
+
+    // rename Alpha → Gamma
+    await ctx1.log.appendEvent('user', 'note.renamed', {
+        from: 'Notes/Alpha.md', to: 'Notes/Gamma.md'
+    });
+
+    // delete Beta
+    await ctx1.log.appendEvent('user', 'note.deleted', {
+        path: 'Notes/Beta.md', last_content_sha: 'bbb'
+    });
+
+    // rename Delta → Epsilon
+    await ctx1.log.appendEvent('user', 'note.renamed', {
+        from: 'Notes/Delta.md', to: 'Notes/Epsilon.md'
+    });
+
+    // delete Epsilon
+    await ctx1.log.appendEvent('user', 'note.deleted', {
+        path: 'Notes/Epsilon.md', last_content_sha: 'ccc'
+    });
+
+    await ctx1.log.dispose();
+
+    // Setup disk: ONLY Gamma.md exists, populated with filler
+    const gammaBytes = noteFiller(2); // 2 lines, 1 chunk
+    fs.write(`${ROOT}/Notes/Gamma.md`, gammaBytes);
+
+    // Run heal
+    const adapter = new FakeAdapter(fs, ROOT);
+    const su = await startupChecks(adapter, ORIGIN, DIR);
+    const ctx2 = spawnContext(ORIGIN, ROOT, {
+        fs,
+        now: () => FIXED_TS,
+                              initialSeq: su.recoveredThroughSeq,
+                              settings: { tier2IdleMs: GEOLOGICAL_IDLE_MS },
+    });
+
+    const heal = await healScan(ctx2.log, adapter, DIR);
+
+    // Assertions: live-set projection must SUBTRACT corpses
+    check('corpse-suppress: heal did not refuse', !heal.refused);
+    check('corpse-suppress: heal examined EXACTLY 1 path (Gamma)',
+          heal.pathsExamined === 1, `got ${heal.pathsExamined}`);
+    check('corpse-suppress: zero "file absent" reports for corpses',
+          countSubstring(fs.getBytes(SHARD)!, 'file absent') === 0,
+          'additive projection files corpses as absent');
+    check('corpse-suppress: chunk.indexed for Gamma (live path)',
+          parseEvents(fs.getBytes(SHARD)!, 'chunk.indexed').length >= 1);
+    check('corpse-suppress: zero chunks for Alpha/Beta/Delta/Epsilon',
+          parseEvents(fs.getBytes(SHARD)!, 'chunk.indexed')
+          .every((e: Record<string,unknown>) => String(e.path) === 'Notes/Gamma.md'));
+
+    // Cleanup
+    await ctx2.log.dispose();
+}
+
 // --- Main -----------------------------------------------------------------------
 
 async function main(): Promise<void> {
     await scenarioCanonical();
     await scenarioReversed();
     await scenarioGapRefusal();
+    await scenarioCorpseSuppress();
     console.log('');
     if (failures === 0) {
-        console.log('F03: ALL GREEN (canonical heal + idempotence + reversed-order vacuity guard + gap refusal)');
+        console.log('F03: ALL GREEN (canonical heal + idempotence + reversed-order vacuity guard + gap refusal + corpse suppression)');
     } else {
         console.log(`F03: ${failures} RED`);
     }

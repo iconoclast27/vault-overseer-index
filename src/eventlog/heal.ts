@@ -35,6 +35,16 @@
 // and renders with the stub shape (empty chain, null fm) — byte-for-byte
 // what the old three-argument stub call produced.
 //
+// Migration note 2026-10-25: the path projection moved to ./projection.ts
+// (single-implementation rule — reconcile and the index projection seam
+// are incoming consumers) AND changed semantics from ADDITIVE to
+// LIVE-SET subtractive: note.deleted and note.renamed-from paths leave
+// the examined set. This kills the corpse-noise defect (live-observed
+// 2026-10-25: "file absent" reports filed every boot for deleted and
+// renamed-away paths — integrity noise wearing the uniform of signal,
+// F03 scenario corpse-suppress is the fixture earning this). A path the
+// spine says is dead heals to silence; its tombstone IS the record.
+//
 // Scope notes (owed, visible):
 //   - chunk.evicted for stale vhs whose offsets no longer reproduce:
 //     parked with the real chunker (sha-drift is its neighbor, F05).
@@ -44,6 +54,7 @@
 
 import type { EventLog } from './eventlog.ts';
 import { mergeScan, type ByteSource, type ParsedLine } from './reader.ts';
+import { projectPaths } from './projection.ts';
 import { chunkStub, contentSha } from '../chunker/stub.ts';
 import { embedVh, renderEmbedInput } from '../chunker/render.ts';
 
@@ -82,17 +93,14 @@ export async function healScan(
             p1Failures: 0, p1Skipped: 0, refused: true };
     }
 
-    // Projection from the contiguous prefix: paths known from Tier-1 note
-    // facts, and existing chunk coverage per path.
-    const notePaths = new Set<string>();
+    // Projection from the contiguous prefix: LIVE paths (shared
+    // projection.ts, subtractive semantics — see migration note) and
+    // existing chunk coverage per path.
+    const { livePaths: notePaths } = projectPaths(scan.events);
     const existingChunks = new Map<string, ParsedLine[]>();
     for (const e of scan.events) {
         const t = String(e.type);
-        if (t === 'note.created' || t === 'note.modified') {
-            if (typeof e.path === 'string') notePaths.add(e.path);
-        } else if (t === 'note.renamed') {
-            if (typeof e.to === 'string') notePaths.add(e.to);
-        } else if (t === 'chunk.indexed' && typeof e.path === 'string') {
+        if (t === 'chunk.indexed' && typeof e.path === 'string') {
             const list = existingChunks.get(e.path) ?? [];
             list.push(e);
             existingChunks.set(e.path, list);
