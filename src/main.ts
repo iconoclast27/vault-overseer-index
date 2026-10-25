@@ -72,8 +72,7 @@
 //   Farewell ordering doctrine, unchanged: onunload() is SYNCHRONOUS
 //   and enqueues farewell dwell events into the serialized write
 //   queue BEFORE dispose() is called — the queue's serialization,
-//   plus this ordering, makes the farewell race structurally
-//   impossible.
+//   plus this ordering, makes the race structurally impossible.
 //
 // 0.1.3-bound — F03 HEAL SCAN WIRING (ratified 2026-10-23):
 //
@@ -194,6 +193,7 @@ import { startupChecks } from './eventlog/reader.ts';
 import { verifyChain } from './eventlog/checkpoint.ts';
 import { healScan } from './eventlog/heal.ts';
 import { DwellGate } from './dwell/gate.ts';
+import { makeWatcherLane } from './watcher/watch.ts';
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -420,6 +420,50 @@ export default class VaultOverseerIndex extends Plugin {
         emit: (path, dwell) => this.emitDwell(path, dwell),
     });
 
+    // --- Watcher lane adapter state (semantics live in src/watcher/watch.ts) ---
+
+    /**
+     * The pure watcher lane, wired to this plugin's writer. Field
+     * initializer is safe: the deps closures capture `this` lazily,
+     * so the lane exists before onload but cannot emit into a dark
+     * writer. Dark-buffer cap defaults to 500 per session ruling
+     * 2026-10-25.
+     */
+    private readonly watcherLane = makeWatcherLane(
+        {
+            stat: async (path: string) => {
+                const stat = await this.app.vault.adapter.stat(path);
+                if (stat === null || stat.type !== 'file') {
+                    throw new Error(`Watcher stat: file absent (${path})`);
+                }
+                return { mtime: stat.mtime, bytes: stat.size };
+            },
+            contentSha: async (path: string) => {
+                const bytes = await this.app.vault.adapter.readBinary(path);
+                if (bytes === undefined) {
+                    throw new Error(`Watcher sha: file absent (${path})`);
+                }
+                const hash = await crypto.subtle.digest(
+                    'SHA-256',
+                    new Uint8Array(bytes),
+                );
+                return Array.from(new Uint8Array(hash))
+                .map((b) => b.toString(16).padStart(2, '0'))
+                .join('')
+                .slice(0, 16);
+            },
+            appendEvent: async (actor, type, payload) => {
+                if (this.log === null) return; // writer dark: drop
+                await this.log.appendEvent(actor, type, payload);
+            },
+            reportIntegrity: async (detail) => {
+                if (this.log === null) return;
+                await this.log.reportIntegrity(detail);
+            },
+        },
+        { darkBufferCap: 500 },
+    );
+
     /** Sequential counter backing the TFile→noteId map. */
     private noteIdCounter = 0;
 
@@ -477,6 +521,16 @@ export default class VaultOverseerIndex extends Plugin {
         // happen — the gate's truth must not depend on the writer's mood.
         this.registerEvent(
             this.app.vault.on('rename', (file, oldPath) => this.onVaultRename(file, oldPath)),
+        );
+
+        // Watcher wiring (F12, 2026-10-25). Same registerEvent doctrine:
+        // tracked even while the writer is dark; emissions drop silently
+        // until flushAfterAttach() is called at the end of startWriter.
+        this.registerEvent(
+            this.app.vault.on('create', (file) => this.onVaultCreate(file)),
+        );
+        this.registerEvent(
+            this.app.vault.on('delete', (file) => this.onVaultDelete(file)),
         );
 
         this.addSettingTab(new OverseerSettingTab(this.app, this));
@@ -563,6 +617,39 @@ export default class VaultOverseerIndex extends Plugin {
     private async emitRename(from: string, to: string): Promise<void> {
         if (this.log === null) return; // writer dark: Rung 2 pending or foreign-origin
         await this.log.appendEvent('user', 'note.renamed', { from, to });
+    }
+
+    // ---------------------------------------------------------------------------
+    // Watcher adapter (thin wiring; F12, 2026-10-25)
+    // ---------------------------------------------------------------------------
+
+    /**
+     * Vault create receipt: filter to md files, forward to the lane.
+     * Drops silently while dark; the lane buffers facts at observation
+     * time (mtime/bytes/sha frozen then, even if the file changes
+     * before flush — stat-drift trap avoided).
+     */
+    private async onVaultCreate(file: TAbstractFile): Promise<void> {
+        if (!(file instanceof TFile)) return;
+        await this.watcherLane.onVaultCreate({
+            path: file.path,
+            isFolder: false,
+            ext: file.extension,
+        });
+    }
+
+    /**
+     * Vault delete receipt: filter to md files, forward to the lane.
+     * The lane consumes the last-known sha as a tombstone; absent when
+     * the path was never observed (pre-watcher file, rename victim).
+     */
+    private async onVaultDelete(file: TAbstractFile): Promise<void> {
+        if (!(file instanceof TFile)) return;
+        await this.watcherLane.onVaultDelete({
+            path: file.path,
+            isFolder: false,
+            ext: file.extension,
+        });
     }
 
     // ---------------------------------------------------------------------------
@@ -687,6 +774,11 @@ export default class VaultOverseerIndex extends Plugin {
             console.error('[vault-overseer] heal scan threw:', detail);
             await this.log.reportIntegrity(`heal scan threw: ${detail}`);
         }
+
+        // ARMING: the writer is up, drain the dark buffer and arm the
+        // watcher lane live. Overflow disclosure (if any) precedes the
+        // drained facts; the spill is named before the survivors land.
+        void this.watcherLane.flushAfterAttach();
     }
 
     /**

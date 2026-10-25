@@ -849,6 +849,90 @@ var DwellGate = class {
   }
 };
 
+// src/watcher/watch.ts
+function makeWatcherLane(deps, options = {}) {
+  const cap = options.darkBufferCap ?? 500;
+  const buffer = [];
+  let live = false;
+  let droppedDark = 0;
+  const lastShaByPath = /* @__PURE__ */ new Map();
+  function isEmittable(file) {
+    if (file.isFolder) return false;
+    return file.ext.toLowerCase() === "md";
+  }
+  async function emit(fact) {
+    if (!live) {
+      if (buffer.length >= cap) {
+        buffer.shift();
+        droppedDark++;
+      }
+      buffer.push(fact);
+      return;
+    }
+    await append(fact);
+  }
+  async function append(fact) {
+    if (fact.type === "note.deleted") {
+      const payload = { path: fact.path };
+      if (fact.last_content_sha !== void 0) {
+        payload.last_content_sha = fact.last_content_sha;
+      }
+      await deps.appendEvent("user", fact.type, payload);
+      return;
+    }
+    await deps.appendEvent("user", fact.type, {
+      path: fact.path,
+      mtime: fact.mtime,
+      bytes: fact.bytes,
+      content_sha: fact.content_sha
+    });
+  }
+  async function onVaultCreate(file) {
+    if (!isEmittable(file)) return;
+    const stat = await deps.stat(file.path);
+    const sha = await deps.contentSha(file.path);
+    lastShaByPath.set(file.path, sha);
+    await emit({
+      type: "note.created",
+      path: file.path,
+      mtime: stat.mtime,
+      bytes: stat.bytes,
+      content_sha: sha
+    });
+  }
+  async function onVaultDelete(file) {
+    if (!isEmittable(file)) return;
+    const lastSha = lastShaByPath.get(file.path);
+    lastShaByPath.delete(file.path);
+    await emit({ type: "note.deleted", path: file.path, last_content_sha: lastSha });
+  }
+  async function flushAfterAttach() {
+    if (droppedDark > 0) {
+      const n = droppedDark;
+      droppedDark = 0;
+      if (deps.reportIntegrity !== void 0) {
+        await deps.reportIntegrity(
+          `watcher dark-buffer overflow: ${n} file facts dropped (oldest) \u2014 writer attach delayed beyond cap`
+        );
+      }
+    }
+    while (buffer.length > 0) {
+      const fact = buffer.shift();
+      if (fact === void 0) break;
+      await append(fact);
+    }
+    live = true;
+  }
+  return {
+    onVaultCreate,
+    onVaultDelete,
+    flushAfterAttach,
+    get pendingCount() {
+      return buffer.length;
+    }
+  };
+}
+
 // src/main.ts
 var EVENTS_DIR = "_vault-index/events";
 var ORIGIN_FILE = "origin.txt";
@@ -961,6 +1045,45 @@ var VaultOverseerIndex = class extends import_obsidian.Plugin {
   dwellGate = new DwellGate({
     emit: (path, dwell) => this.emitDwell(path, dwell)
   });
+  // --- Watcher lane adapter state (semantics live in src/watcher/watch.ts) ---
+  /**
+   * The pure watcher lane, wired to this plugin's writer. Field
+   * initializer is safe: the deps closures capture `this` lazily,
+   * so the lane exists before onload but cannot emit into a dark
+   * writer. Dark-buffer cap defaults to 500 per session ruling
+   * 2026-10-25.
+   */
+  watcherLane = makeWatcherLane(
+    {
+      stat: async (path) => {
+        const stat = await this.app.vault.adapter.stat(path);
+        if (stat === null || stat.type !== "file") {
+          throw new Error(`Watcher stat: file absent (${path})`);
+        }
+        return { mtime: stat.mtime, bytes: stat.size };
+      },
+      contentSha: async (path) => {
+        const bytes = await this.app.vault.adapter.readBinary(path);
+        if (bytes === void 0) {
+          throw new Error(`Watcher sha: file absent (${path})`);
+        }
+        const hash = await crypto.subtle.digest(
+          "SHA-256",
+          new Uint8Array(bytes)
+        );
+        return Array.from(new Uint8Array(hash)).map((b) => b.toString(16).padStart(2, "0")).join("").slice(0, 16);
+      },
+      appendEvent: async (actor, type, payload) => {
+        if (this.log === null) return;
+        await this.log.appendEvent(actor, type, payload);
+      },
+      reportIntegrity: async (detail) => {
+        if (this.log === null) return;
+        await this.log.reportIntegrity(detail);
+      }
+    },
+    { darkBufferCap: 500 }
+  );
   /** Sequential counter backing the TFile→noteId map. */
   noteIdCounter = 0;
   /**
@@ -992,6 +1115,12 @@ var VaultOverseerIndex = class extends import_obsidian.Plugin {
     );
     this.registerEvent(
       this.app.vault.on("rename", (file, oldPath) => this.onVaultRename(file, oldPath))
+    );
+    this.registerEvent(
+      this.app.vault.on("create", (file) => this.onVaultCreate(file))
+    );
+    this.registerEvent(
+      this.app.vault.on("delete", (file) => this.onVaultDelete(file))
     );
     this.addSettingTab(new OverseerSettingTab(this.app, this));
   }
@@ -1063,6 +1192,36 @@ var VaultOverseerIndex = class extends import_obsidian.Plugin {
   async emitRename(from, to) {
     if (this.log === null) return;
     await this.log.appendEvent("user", "note.renamed", { from, to });
+  }
+  // ---------------------------------------------------------------------------
+  // Watcher adapter (thin wiring; F12, 2026-10-25)
+  // ---------------------------------------------------------------------------
+  /**
+   * Vault create receipt: filter to md files, forward to the lane.
+   * Drops silently while dark; the lane buffers facts at observation
+   * time (mtime/bytes/sha frozen then, even if the file changes
+   * before flush — stat-drift trap avoided).
+   */
+  async onVaultCreate(file) {
+    if (!(file instanceof import_obsidian.TFile)) return;
+    await this.watcherLane.onVaultCreate({
+      path: file.path,
+      isFolder: false,
+      ext: file.extension
+    });
+  }
+  /**
+   * Vault delete receipt: filter to md files, forward to the lane.
+   * The lane consumes the last-known sha as a tombstone; absent when
+   * the path was never observed (pre-watcher file, rename victim).
+   */
+  async onVaultDelete(file) {
+    if (!(file instanceof import_obsidian.TFile)) return;
+    await this.watcherLane.onVaultDelete({
+      path: file.path,
+      isFolder: false,
+      ext: file.extension
+    });
   }
   // ---------------------------------------------------------------------------
   // Writer boot
@@ -1137,6 +1296,7 @@ var VaultOverseerIndex = class extends import_obsidian.Plugin {
       console.error("[vault-overseer] heal scan threw:", detail);
       await this.log.reportIntegrity(`heal scan threw: ${detail}`);
     }
+    void this.watcherLane.flushAfterAttach();
   }
   /**
    * SYNCHRONOUS, and the order below is load-bearing: farewell dwell
