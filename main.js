@@ -485,6 +485,36 @@ async function mergeScan(source, eventsDir) {
   return { events, integrity, gaps };
 }
 
+// src/eventlog/projection.ts
+function projectPaths(events) {
+  const livePaths = /* @__PURE__ */ new Set();
+  const deadPaths = /* @__PURE__ */ new Set();
+  for (const e of events) {
+    const t = String(e.type);
+    if (t === "note.created" || t === "note.modified") {
+      if (typeof e.path === "string") {
+        livePaths.add(e.path);
+        deadPaths.delete(e.path);
+      }
+    } else if (t === "note.renamed") {
+      if (typeof e.from === "string") {
+        livePaths.delete(e.from);
+        deadPaths.add(e.from);
+      }
+      if (typeof e.to === "string") {
+        livePaths.add(e.to);
+        deadPaths.delete(e.to);
+      }
+    } else if (t === "note.deleted") {
+      if (typeof e.path === "string") {
+        livePaths.delete(e.path);
+        deadPaths.add(e.path);
+      }
+    }
+  }
+  return { livePaths, deadPaths };
+}
+
 // src/chunker/render.ts
 var import_node_crypto2 = require("node:crypto");
 function sha16(bytes) {
@@ -584,15 +614,11 @@ async function healScan(log, source, eventsDir) {
       refused: true
     };
   }
-  const notePaths = /* @__PURE__ */ new Set();
+  const { livePaths: notePaths } = projectPaths(scan.events);
   const existingChunks = /* @__PURE__ */ new Map();
   for (const e of scan.events) {
     const t = String(e.type);
-    if (t === "note.created" || t === "note.modified") {
-      if (typeof e.path === "string") notePaths.add(e.path);
-    } else if (t === "note.renamed") {
-      if (typeof e.to === "string") notePaths.add(e.to);
-    } else if (t === "chunk.indexed" && typeof e.path === "string") {
+    if (t === "chunk.indexed" && typeof e.path === "string") {
       const list = existingChunks.get(e.path) ?? [];
       list.push(e);
       existingChunks.set(e.path, list);
@@ -923,10 +949,19 @@ function makeWatcherLane(deps, options = {}) {
     }
     live = true;
   }
+  async function reconcilePaths(vaultPaths, knownPaths) {
+    if (!live) return -1;
+    const missing = vaultPaths.filter((p) => !knownPaths.has(p)).sort();
+    for (const path of missing) {
+      await onVaultCreate({ path, isFolder: false, ext: "md" });
+    }
+    return missing.length;
+  }
   return {
     onVaultCreate,
     onVaultDelete,
     flushAfterAttach,
+    reconcilePaths,
     get pendingCount() {
       return buffer.length;
     }
@@ -936,6 +971,8 @@ function makeWatcherLane(deps, options = {}) {
 // src/main.ts
 var EVENTS_DIR = "_vault-index/events";
 var ORIGIN_FILE = "origin.txt";
+var RECONCILE_REFUSED_DARK = -1;
+var RECONCILE_REFUSED_GAP = -2;
 var DEFAULT_SETTINGS = {};
 var VaultLogAdapter = class {
   constructor(inner) {
@@ -1036,6 +1073,12 @@ var VaultOverseerIndex = class extends import_obsidian.Plugin {
    * scrub is never silent.
    */
   scrubbedLegacyOrigin = null;
+  /**
+   * The vault-facing adapter (B3, 2026-10-25). Promoted from a local in
+   * onload/certifyOrigin so reconcile can reach mergeScan's ByteSource
+   * door. Set first thing in onload; null only before that.
+   */
+  adapter = null;
   // --- Dwell-gate adapter state (semantics live in src/dwell/gate.ts) ---
   /**
    * The pure gate, wired to this plugin's writer. Field initializer
@@ -1098,9 +1141,9 @@ var VaultOverseerIndex = class extends import_obsidian.Plugin {
   noteIdMap = /* @__PURE__ */ new WeakMap();
   async onload() {
     await this.loadSettings();
-    const adapter = new VaultLogAdapter(this.app.vault.adapter);
+    this.adapter = new VaultLogAdapter(this.app.vault.adapter);
     const pluginFolder = this.manifest.dir ?? `.obsidian/plugins/${this.manifest.id}`;
-    const resolution = await resolveOrigin(adapter, pluginFolder);
+    const resolution = await resolveOrigin(this.adapter, pluginFolder);
     if (resolution.origin === null) {
       this.pendingCertification = resolution.foundOrigins;
       new import_obsidian.Notice(
@@ -1108,7 +1151,7 @@ var VaultOverseerIndex = class extends import_obsidian.Plugin {
         15e3
       );
     } else {
-      await this.startWriter(adapter, resolution.origin, resolution.fromOriginFile);
+      await this.startWriter(this.adapter, resolution.origin, resolution.fromOriginFile);
     }
     this.registerEvent(
       this.app.workspace.on("file-open", (file) => this.onFileOpen(file))
@@ -1123,8 +1166,56 @@ var VaultOverseerIndex = class extends import_obsidian.Plugin {
       this.registerEvent(
         this.app.vault.on("delete", (file) => this.onVaultDelete(file))
       );
+      void this.runReconcileWithVault();
     });
     this.addSettingTab(new OverseerSettingTab(this.app, this));
+  }
+  // ---------------------------------------------------------------------------
+  // B3 reconcile (wiring: automatic gate + manual button + post-certification)
+  // ---------------------------------------------------------------------------
+  /**
+   * Reconcile routine (B3): fold the spine's live-set via mergeScan +
+   * projectPaths, diff against the vault's getMarkdownFiles(), and ask
+   * the lane to emit note.created for the gaps. Idempotent against the
+   * spine's own live-set (F12 S10), so a clean spine costs one fold and
+   * emits nothing.
+   *
+   * PUBLIC because the settings tab calls it (cross-class).
+   *
+   * Returns: >= 0 = paths emitted; -1 = refused, writer dark;
+   * -2 = refused, seq gap in the spine (never fabricate across a
+   * truncated scan — F03 doctrine).
+   */
+  async runReconcileWithVault() {
+    if (this.log === null || this.adapter === null || this.originId === null) {
+      return RECONCILE_REFUSED_DARK;
+    }
+    const scan = await mergeScan(this.adapter, EVENTS_DIR);
+    if (scan.gaps.length > 0) {
+      const first = scan.gaps[0];
+      if (first === void 0) return RECONCILE_REFUSED_GAP;
+      const detail = `reconcile refused: seq gap in spine (origin=${first.origin}, expected_seq=${first.expected_seq}, got_seq=${first.got_seq}) \u2014 fix the gap before reconciling`;
+      console.error("[vault-overseer]", detail);
+      new import_obsidian.Notice(`Vault Overseer: ${detail}`, 15e3);
+      await this.log.reportIntegrity(detail);
+      return RECONCILE_REFUSED_GAP;
+    }
+    if (scan.integrity.length > 0) {
+      await this.log.reportIntegrity(
+        `reconcile scan: ${scan.integrity.map((r) => r.detail).join("; ")}`
+      );
+    }
+    const proj = projectPaths(scan.events);
+    const knownSet = proj.livePaths;
+    const vaultPaths = this.app.vault.getMarkdownFiles().map((f) => f.path);
+    const emitted = await this.watcherLane.reconcilePaths(vaultPaths, knownSet);
+    if (emitted > 0) {
+      new import_obsidian.Notice(`Vault Overseer: reconciled ${emitted} paths`, 15e3);
+      await this.log.reportIntegrity(
+        `reconcile: backfilled ${emitted} first-contact paths (origin=${this.originId})`
+      );
+    }
+    return emitted;
   }
   // ---------------------------------------------------------------------------
   // Dwell-gate adapter (thin wiring; semantics in src/dwell/gate.ts)
@@ -1298,7 +1389,7 @@ var VaultOverseerIndex = class extends import_obsidian.Plugin {
       console.error("[vault-overseer] heal scan threw:", detail);
       await this.log.reportIntegrity(`heal scan threw: ${detail}`);
     }
-    void this.watcherLane.flushAfterAttach();
+    await this.watcherLane.flushAfterAttach();
   }
   /**
    * SYNCHRONOUS, and the order below is load-bearing: farewell dwell
@@ -1365,15 +1456,25 @@ var VaultOverseerIndex = class extends import_obsidian.Plugin {
    * Rung 2 completion: human-certify this machine against an existing
    * shard (or a brand-new id). Writes origin.txt, then boots the writer
    * through the same startWriter() path the Rung-1 path uses.
+   *
+   * B3 (2026-10-25): reconciles after booting. This is the door that
+   * matters most — a virgin install's automatic gate fires before
+   * certification and refuses (writer dark), so without this call the
+   * fresh-spine black hole would wait on a human remembering a button.
+   * startWriter awaits flushAfterAttach, so the lane is armed here.
    */
   async certifyOrigin(origin) {
     const trimmed = origin.trim();
     if (trimmed.length === 0) return;
-    const adapter = new VaultLogAdapter(this.app.vault.adapter);
+    if (this.adapter === null) {
+      console.error("[vault-overseer] certifyOrigin: adapter not initialized");
+      return;
+    }
     const pluginFolder = this.manifest.dir ?? `.obsidian/plugins/${this.manifest.id}`;
-    await writeOriginFile(adapter, pluginFolder, trimmed);
+    await writeOriginFile(this.adapter, pluginFolder, trimmed);
     this.pendingCertification = null;
-    await this.startWriter(adapter, trimmed, false);
+    await this.startWriter(this.adapter, trimmed, false);
+    await this.runReconcileWithVault();
     this.app.setting?.activeTab?.display?.();
   }
 };
@@ -1390,6 +1491,16 @@ var OverseerSettingTab = class extends import_obsidian.PluginSettingTab {
       "Per-device shard id. Identity lives in origin.txt inside the plugin folder \u2014 sync-excluded, BRAT-proof. Edit that file (or certify below) to change it; the origin setting itself is gone from data.json."
     ).addText(
       (text) => text.setPlaceholder("uncertified").setValue(this.plugin.originId ?? "").setDisabled(true)
+    );
+    new import_obsidian.Setting(containerEl).setName("Reconcile with vault").setDesc(
+      "Backfill first-contact paths into the spine. Safe to click repeatedly \u2014 idempotent: if the spine already knows everything, nothing is emitted. Refuses (loudly) across a seq gap rather than fabricate facts from a truncated scan."
+    ).addButton(
+      (btn) => btn.setButtonText("Reconcile now").setCta().onClick(async () => {
+        const emitted = await this.plugin.runReconcileWithVault();
+        if (emitted === 0) {
+          new import_obsidian.Notice("Vault Overseer: vault and index agree", 6e3);
+        }
+      })
     );
     if (this.plugin.pendingCertification !== null) {
       containerEl.createEl("h3", { text: "Certify this machine's identity" });
