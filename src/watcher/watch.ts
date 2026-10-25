@@ -2,6 +2,27 @@
 // Vault Overseer — Watcher Lane (F12 module under test)
 // src/watcher/watch.ts
 //
+// rev C (2026-10-25, B3 reconcile — first-contact backfill + manual button):
+//   - reconcilePaths(vaultPaths, knownPaths) added: emit note.created for
+//     every vaultPath the spine's LIVE set doesn't know, through the
+//     existing create path (stats at observation time, sha map fed, so
+//     backfilled paths get real tombstones on later deletes). Idempotent
+//     BY CONSTRUCTION against the caller's known-set; the lane keeps no
+//     ever-seen dedup of its own — a restored file (spine dead, disk
+//     alive) reconciles (S13).
+//   - Reconcile REFUSES while dark: returns -1 with ZERO buffer growth.
+//     Backfilling into the capped dark buffer (500 default) would
+//     truncate the inventory silently-in-principle — the exact hole B3
+//     exists to close. Armed-lane operation, full stop (S12). Refusal
+//     is not poisoning: post-arm retry succeeds.
+//   - Emission order is SORTED by path for determinism — the vault's
+//     enumeration order is arbitrary, the spine deserves better.
+//   - Caller contract: main.ts computes knownPaths via projectPaths()
+//     (src/eventlog/projection.ts, the shared live-set fold), passes
+//     getMarkdownFiles() paths in, and reports the returned count.
+//     The automatic gate at arming and the manual settings button are
+//     the same routine behind two doors.
+//
 // rev B (2026-10-25, pre-wiring alignment to Schema v0.2 catalog):
 //   - note.deleted now carries last_content_sha (the tombstone payload):
 //     the lane tracks the last-known sha per path from every create's
@@ -102,6 +123,16 @@ export interface WatcherLane {
     onVaultDelete(file: FileLike): Promise<void>;
     /** Disclose overflow, drain the dark buffer, arm the lane. Call ONCE, on writer attach. */
     flushAfterAttach(): Promise<void>;
+    /**
+     * First-contact / manual reconcile (B3): emit note.created for every
+     * vaultPath the spine's live-set doesn't know, through the existing
+     * create path. Populates the tombstone map on the way through.
+     * Idempotent against the caller's known-set by construction.
+     * REFUSES while dark: returns -1 with zero buffer growth (cap
+     * protection — never backfill into the dark buffer). Returns the
+     * number of facts emitted for the caller's integrity receipt.
+     */
+    reconcilePaths(vaultPaths: string[], knownPaths: ReadonlySet<string>): Promise<number>;
     /** Buffered-but-unflushed dark facts. */
     readonly pendingCount: number;
 }
@@ -219,10 +250,38 @@ export function makeWatcherLane(
         live = true;
     }
 
+    async function reconcilePaths(
+        vaultPaths: string[],
+        knownPaths: ReadonlySet<string>,
+    ): Promise<number> {
+        // ARMED-LANE OPERATION. Backfilling into the capped dark buffer
+        // would truncate the inventory silently-in-principle — the exact
+        // hole B3 exists to close. Loud refusal, zero side effects.
+        if (!live) return -1;
+
+        // Deterministic emission order: vault enumeration is arbitrary,
+        // the spine deserves better than "whatever getMarkdownFiles felt
+        // like today."
+        const missing = vaultPaths
+        .filter((p) => !knownPaths.has(p))
+        .sort();
+
+        for (const path of missing) {
+            // Through the existing create path: isEmittable (defense in
+            // depth — the caller SHOULD pass md-only paths from
+            // getMarkdownFiles, but the lane re-checks its own rules),
+            // stats at observation time, sha map fed, armed append.
+            await onVaultCreate({ path, isFolder: false, ext: 'md' });
+        }
+
+        return missing.length;
+    }
+
     return {
         onVaultCreate,
         onVaultDelete,
         flushAfterAttach,
+        reconcilePaths,
         get pendingCount() {
             return buffer.length;
         },

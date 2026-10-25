@@ -7,6 +7,65 @@
 // F03 heal scan, and expose the Plugin 2 seam. Everything here is wiring;
 // the spine's semantics live in src/eventlog/*.
 //
+// 0.1.6-bound — RECONCILE GATE (B3, 2026-10-25):
+//
+//   Two doors, one routine:
+//     1) Automatic gate at arming: inside onLayoutReady, after listener
+//        registration, compute the live-set diff (spine vs vault via
+//        getMarkdownFiles(), l.10418), call reconcilePaths only if the
+//        diff is non-empty, and emit a loud log.integrity declaring the
+//        count when backfill happens.
+//     2) Manual settings button: "Reconcile with vault" — same diff,
+//        feeds the lane's return count into a Notice toaster.
+//   Plus a third door discovered while wiring: certifyOrigin() calls the
+//   same routine after startWriter, because on a virgin install the
+//   automatic gate fires BEFORE certification (log === null) and refuses.
+//   Without this, the exact case B3 exists to seal — fresh spine,
+//   installation black hole — would wait on a human pressing a button.
+//
+//   Gate doctrine: runs EVERY arming (not just "fresh spine"), keyed on
+//   the diff, not the spine age. Idempotence (F12 S10) makes it free when
+//   clean; crash-mid-backfill self-heals on the next boot (S11). The
+//   caller holds no freshness state.
+//
+//   GAP REFUSAL (F03 doctrine): mergeScan halts a gapped shard and
+//   returns only the pre-gap events. Folding a projection from that
+//   truncated stream would UNDERSTATE the live-set, and reconcile would
+//   then FABRICATE note.created for paths the spine actually knows beyond
+//   the gap — a never-fabricate violation, the exact crime the gap-refusal
+//   lane exists to prevent. So reconcile refuses across a gapped spine,
+//   loudly, with its own return code (-2). Same posture as heal.
+//
+//   SEQUENCING (single pass, honest): On a Rung-1 boot, startWriter runs
+//   to completion in onload, calling flushAfterAttach() at its end. By the
+//   time onLayoutReady fires, the lane is ALREADY ARMED — no dark refusal
+//   is possible on this path. The single pass folds its diff post-arming,
+//   which is what S12 requires.
+//
+//   TWO-BOOT VISIBILITY (declared consequence, not a bug): healScan runs
+//   inside startWriter, BEFORE arming; reconcile runs after, in
+//   onLayoutReady. So on boot 1 the spine learns every first-contact path
+//   but heal has already run against the pre-backfill spine and indexed
+//   nothing. Boot 2's heal sees the paths and indexes the vault. Benign —
+//   content is never lost, only deferred one boot. Collapsing it to one
+//   boot means arming the lane BEFORE healScan, which is a design change
+//   to code Option A already live-verified; OPEN RULING, not taken here.
+//
+//   DOUBLE-EMIT WINDOW (declared, narrow): listeners register first,
+//   reconcile reads the spine after. A create arriving in that window is
+//   buffered by the lane but not yet on disk when the diff folds, so
+//   reconcile re-emits it — a duplicate note.created. Harmless: the
+//   projection fuses duplicate creates on one path into a single live
+//   entry, and the second emission carries fresher stat/sha. Accepted to
+//   keep the pass single and the arming window short. Closing it means
+//   swapping the order (reconcile, THEN register listeners) at the cost of
+//   a longer window in which real events are missed. OPEN RULING.
+//
+//   SPINE READ: mergeScan() from reader.ts — the same disciplined door
+//   heal uses (torn-tail aware, contiguity-checked, gap-reporting).
+//   Projection via projectPaths() — shared with heal, single
+//   implementation, no second dialect of "what does the spine say exists."
+//
 // 0.1.6-bound — WATCHER REGISTRATION DEFERRAL (Option A, 2026-10-25):
 //
 //   The create/delete listeners now register INSIDE
@@ -29,8 +88,9 @@
 //   only during boot, and nothing downstream starves — the heal scan
 //   indexes content independently of note.created. Option B (deliberate
 //   backfill at arming via getMarkdownFiles(), l.10418) is the ratified
-//   successor: once A is live-verified, the spine gains a controlled,
-//   uncapped first-contact snapshot so a fresh shard learns the world.
+//   successor, NOW IMPLEMENTED as the B3 gate above: the spine gains a
+//   controlled, uncapped first-contact snapshot so a fresh shard learns
+//   the world.
 //
 // 0.1.5-bound — RENAME WIRING (F05a, ratified 2026-10-24):
 //
@@ -172,7 +232,7 @@
 //   v1 limitations (declared, not hidden):
 //     - Threshold emissions carry dwell=10 flat; richer dwell values
 //       belong to a close-emit world this version does not build.
-//     - Dwell banked while the writer is dark (Rung 2 pending,
+//     - Dwell banked while the writer is dark (Rung-2 pending,
 //       foreign-origin block) is lost.
 //     - The accrual map is session-scoped, one entry per distinct
 //       note opened; no persistence across reloads.
@@ -188,7 +248,7 @@
 //   onLayoutReady(callback: () => any): void — obsidian.d.ts l.10740,
 //   with the create-at-load guidance at l.10429. Verified 2026-10-25.
 //   getMarkdownFiles(): TFile[] — obsidian.d.ts l.10418. Verified
-//   2026-10-25 (Option B ammunition, unused in Option A).
+//   2026-10-25 (Option B ammunition; now load-bearing for B3).
 //
 // 0.1.2 — CHAIN-VERIFICATION REPORT FOLD (ratified 2026-10-23):
 //
@@ -199,7 +259,7 @@
 //   plugin's own Tier-1 appends, plus Sync's mid-flight arrivals);
 //   the throw path double-reported with different wording; and the
 //   unguarded second call could throw past onload, killing the
-//   session.opened-interim beacon — the integrity recorder silencing
+//   session.opened beacon — the integrity recorder silencing
 //   the session record. Fold: ONE read, ONE report, one channel.
 //
 // Consequence: data.json carries shared knobs only. Per-device state
@@ -219,9 +279,10 @@ import {
 } from 'obsidian';
 
 import { EventLog, defaultLocalIso } from './eventlog/eventlog.ts';
-import { startupChecks } from './eventlog/reader.ts';
+import { startupChecks, mergeScan } from './eventlog/reader.ts';
 import { verifyChain } from './eventlog/checkpoint.ts';
 import { healScan } from './eventlog/heal.ts';
+import { projectPaths } from './eventlog/projection.ts';
 import { DwellGate } from './dwell/gate.ts';
 import { makeWatcherLane } from './watcher/watch.ts';
 
@@ -236,6 +297,11 @@ const ORIGIN_FILE = 'origin.txt';
 // src/dwell/gate.ts. Promoting it to a shared data.json knob is future
 // icing (it only tunes behavior — the moment a setting changes WHAT
 // gets logged, it moves to sync-excluded lanes).
+
+// Reconcile return codes. Positive = paths emitted. Negative = refusal,
+// with the reason distinguishable so both doors can say why.
+const RECONCILE_REFUSED_DARK = -1;
+const RECONCILE_REFUSED_GAP = -2;
 
 // -----------------------------------------------------------------------------
 // Settings — shared knobs ONLY (data.json rides Sync; identity does not)
@@ -258,10 +324,14 @@ const DEFAULT_SETTINGS: VaultOverseerSettings = {};
 
 /**
  * Thin wrapper: normalizes paths and maps list() to bare names. Satisfies
- * both the EventLog's LogAdapter and the reader's ByteSource — one
- * adapter, one filesystem view. Plugin-folder paths (origin.txt) also
- * route through here; the vault-relative path passed by the caller
- * already contains the plugin folder segment.
+ * the EventLog's LogAdapter, the reader's ByteSource, and the watcher's
+ * dep surface — one adapter, one filesystem view. Plugin-folder paths
+ * (origin.txt) also route through here; the vault-relative path passed by
+ * the caller already contains the plugin folder segment.
+ *
+ * 2026-10-25 (B3): promoted to a plugin field so reconcile can read the
+ * spine via mergeScan without inventing accessors on EventLog (whose
+ * `adapter` is private — a ghost-API trap avoided).
  */
 class VaultLogAdapter {
     constructor(private readonly inner: App['vault']['adapter']) {}
@@ -439,6 +509,13 @@ export default class VaultOverseerIndex extends Plugin {
      */
     private scrubbedLegacyOrigin: string | null = null;
 
+    /**
+     * The vault-facing adapter (B3, 2026-10-25). Promoted from a local in
+     * onload/certifyOrigin so reconcile can reach mergeScan's ByteSource
+     * door. Set first thing in onload; null only before that.
+     */
+    private adapter: VaultLogAdapter | null = null;
+
     // --- Dwell-gate adapter state (semantics live in src/dwell/gate.ts) ---
 
     /**
@@ -511,7 +588,7 @@ export default class VaultOverseerIndex extends Plugin {
     async onload(): Promise<void> {
         await this.loadSettings();
 
-        const adapter = new VaultLogAdapter(this.app.vault.adapter);
+        this.adapter = new VaultLogAdapter(this.app.vault.adapter);
         // manifest.dir is the vault-relative path to this plugin's
         // folder (obsidian.d.ts l.7378–7381). Typed optional; the
         // fallback is defensive only — dir is always set at runtime
@@ -519,7 +596,7 @@ export default class VaultOverseerIndex extends Plugin {
         const pluginFolder =
         this.manifest.dir ?? `.obsidian/plugins/${this.manifest.id}`;
 
-        const resolution = await resolveOrigin(adapter, pluginFolder);
+        const resolution = await resolveOrigin(this.adapter, pluginFolder);
 
         if (resolution.origin === null) {
             // Rung 2: no origin.txt — shards may or may not exist. Writer
@@ -534,7 +611,7 @@ export default class VaultOverseerIndex extends Plugin {
                 15000,
             );
         } else {
-            await this.startWriter(adapter, resolution.origin, resolution.fromOriginFile);
+            await this.startWriter(this.adapter, resolution.origin, resolution.fromOriginFile);
         }
 
         // Dwell-gate wiring. registerEvent cleans up automatically on
@@ -566,13 +643,22 @@ export default class VaultOverseerIndex extends Plugin {
         // DECLARED LIMITATION (Option A, v1): a genuine create landing
         // between onload and layout-ready is missed — boot-window
         // only, nothing downstream starves (heal indexes content
-        // independently). Option B (deliberate first-contact backfill
-        // via getMarkdownFiles(), l.10418) follows once A is verified.
+        // independently). The B3 gate below closes the resulting
+        // first-contact hole deliberately.
         //
         // registerEvent inside the callback still books cleanup for
         // unload; onLayoutReady runs the callback immediately when the
         // layout is already ready (reload-plugin path), so no
         // registration is ever skipped.
+        //
+        // B3 AUTOMATIC GATE — single pass, post-arming. On a Rung-1
+        // boot, startWriter already ran to completion in onload
+        // (including flushAfterAttach() at its end), so the lane is
+        // ARMED by the time this fires; no dark refusal is possible on
+        // this path. On a Rung-2 install the writer is still dark here
+        // and this call refuses (-1) — certifyOrigin() reconciles after
+        // certification instead. See the header for the declared
+        // double-emit window and the two-boot visibility consequence.
         this.app.workspace.onLayoutReady(() => {
             this.registerEvent(
                 this.app.vault.on('create', (file) => this.onVaultCreate(file)),
@@ -580,9 +666,88 @@ export default class VaultOverseerIndex extends Plugin {
             this.registerEvent(
                 this.app.vault.on('delete', (file) => this.onVaultDelete(file)),
             );
+
+            // Fire and forget: the gate owns its own reporting.
+            void this.runReconcileWithVault();
         });
 
         this.addSettingTab(new OverseerSettingTab(this.app, this));
+    }
+
+    // ---------------------------------------------------------------------------
+    // B3 reconcile (wiring: automatic gate + manual button + post-certification)
+    // ---------------------------------------------------------------------------
+
+    /**
+     * Reconcile routine (B3): fold the spine's live-set via mergeScan +
+     * projectPaths, diff against the vault's getMarkdownFiles(), and ask
+     * the lane to emit note.created for the gaps. Idempotent against the
+     * spine's own live-set (F12 S10), so a clean spine costs one fold and
+     * emits nothing.
+     *
+     * PUBLIC because the settings tab calls it (cross-class).
+     *
+     * Returns: >= 0 = paths emitted; -1 = refused, writer dark;
+     * -2 = refused, seq gap in the spine (never fabricate across a
+     * truncated scan — F03 doctrine).
+     */
+    async runReconcileWithVault(): Promise<number> {
+        if (this.log === null || this.adapter === null || this.originId === null) {
+            // Writer dark (Rung 2 pending, foreign-origin block, or
+            // unloaded). The automatic gate stays silent here; the
+            // manual button explains itself.
+            return RECONCILE_REFUSED_DARK;
+        }
+
+        // Read the spine through the disciplined door: torn-tail aware,
+        // contiguity-checked, gap-reporting. Same scan heal uses.
+        const scan = await mergeScan(this.adapter, EVENTS_DIR);
+
+        // GAP REFUSAL (F03 doctrine). mergeScan HALTS a gapped shard and
+        // returns only the pre-gap events. Projecting from that truncated
+        // stream would understate the live-set, and reconcile would then
+        // fabricate note.created for paths the spine knows beyond the
+        // gap. Never fabricate: refuse, loudly, and name the gap.
+        if (scan.gaps.length > 0) {
+            const first = scan.gaps[0];
+            if (first === undefined) return RECONCILE_REFUSED_GAP;
+            const detail =
+            `reconcile refused: seq gap in spine (origin=${first.origin}, ` +
+            `expected_seq=${first.expected_seq}, got_seq=${first.got_seq}) — ` +
+            'fix the gap before reconciling';
+     console.error('[vault-overseer]', detail);
+     new Notice(`Vault Overseer: ${detail}`, 15000);
+     await this.log.reportIntegrity(detail);
+     return RECONCILE_REFUSED_GAP;
+        }
+
+        // Torn tails and unreadable lines are reported by the scan but do
+        // not invalidate the projection (they sit at the shard's end and
+        // are discarded, not skipped mid-stream). Surface them anyway —
+        // silence is disqualifying.
+        if (scan.integrity.length > 0) {
+            await this.log.reportIntegrity(
+                `reconcile scan: ${scan.integrity.map((r) => r.detail).join('; ')}`,
+            );
+        }
+
+        const proj = projectPaths(scan.events);
+        const knownSet = proj.livePaths;
+
+        const vaultPaths = this.app.vault.getMarkdownFiles().map((f) => f.path);
+        const emitted = await this.watcherLane.reconcilePaths(vaultPaths, knownSet);
+
+        if (emitted > 0) {
+            new Notice(`Vault Overseer: reconciled ${emitted} paths`, 15000);
+            await this.log.reportIntegrity(
+                `reconcile: backfilled ${emitted} first-contact paths ` +
+                `(origin=${this.originId})`,
+            );
+        }
+        // emitted === 0: silent. A clean spine is the steady state; the
+        // automated gate must not chatter on every boot.
+
+        return emitted;
     }
 
     // ---------------------------------------------------------------------------
@@ -815,6 +980,11 @@ export default class VaultOverseerIndex extends Plugin {
         // does NOT escape startWriter — nothing may kill the writer
         // after the beacon has landed. A refused heal is a RECORDED
         // refusal, not a failed boot.
+        //
+        // ORDERING NOTE (B3): heal runs BEFORE the reconcile gate, so on
+        // a fresh spine heal sees no paths and indexes nothing; the
+        // backfill lands after, and boot 2's heal does the indexing. See
+        // "TWO-BOOT VISIBILITY" in the header — declared, open ruling.
         // -----------------------------------------------------------------
         try {
             await healScan(this.log, adapter, EVENTS_DIR);
@@ -831,7 +1001,12 @@ export default class VaultOverseerIndex extends Plugin {
         // normal boot (listeners register at layout-ready, after the
         // firestorm); the dark path remains for the Rung-2
         // certification-late edge.
-        void this.watcherLane.flushAfterAttach();
+        //
+        // Awaited (was fire-and-forget): reconcile refuses while the lane
+        // is dark, and the Rung-2 path calls reconcile immediately after
+        // this returns. Awaiting makes "armed" a fact the next statement
+        // can rely on rather than a hope.
+        await this.watcherLane.flushAfterAttach();
     }
 
     /**
@@ -919,18 +1094,33 @@ export default class VaultOverseerIndex extends Plugin {
      * Rung 2 completion: human-certify this machine against an existing
      * shard (or a brand-new id). Writes origin.txt, then boots the writer
      * through the same startWriter() path the Rung-1 path uses.
+     *
+     * B3 (2026-10-25): reconciles after booting. This is the door that
+     * matters most — a virgin install's automatic gate fires before
+     * certification and refuses (writer dark), so without this call the
+     * fresh-spine black hole would wait on a human remembering a button.
+     * startWriter awaits flushAfterAttach, so the lane is armed here.
      */
     async certifyOrigin(origin: string): Promise<void> {
         const trimmed = origin.trim();
         if (trimmed.length === 0) return;
 
-        const adapter = new VaultLogAdapter(this.app.vault.adapter);
+        if (this.adapter === null) {
+            // Defensive only: onload sets this.adapter before any UI exists.
+            console.error('[vault-overseer] certifyOrigin: adapter not initialized');
+            return;
+        }
+
         const pluginFolder =
         this.manifest.dir ?? `.obsidian/plugins/${this.manifest.id}`;
 
-        await writeOriginFile(adapter, pluginFolder, trimmed);
+        await writeOriginFile(this.adapter, pluginFolder, trimmed);
         this.pendingCertification = null;
-        await this.startWriter(adapter, trimmed, false);
+        await this.startWriter(this.adapter, trimmed, false);
+
+        // Seal the installation black hole: the fresh spine now learns
+        // the world. Refusals (dark/gap) report themselves.
+        await this.runReconcileWithVault();
 
         // Force the settings tab to redraw its certification surface away.
         this.app.setting?.activeTab?.display?.();
@@ -968,6 +1158,31 @@ class OverseerSettingTab extends PluginSettingTab {
         .setPlaceholder('uncertified')
         .setValue(this.plugin.originId ?? '')
         .setDisabled(true),
+        );
+
+        // --- B3: the manual reconcile door ---
+
+        new Setting(containerEl)
+        .setName('Reconcile with vault')
+        .setDesc(
+            'Backfill first-contact paths into the spine. Safe to click ' +
+            'repeatedly — idempotent: if the spine already knows everything, ' +
+            'nothing is emitted. Refuses (loudly) across a seq gap rather ' +
+            'than fabricate facts from a truncated scan.',
+        )
+        .addButton((btn) =>
+        btn
+        .setButtonText('Reconcile now')
+        .setCta()
+        .onClick(async () => {
+            const emitted = await this.plugin.runReconcileWithVault();
+            if (emitted === 0) {
+                new Notice('Vault Overseer: vault and index agree', 6000);
+            }
+            // emitted > 0: the routine already toasted the count.
+            // emitted < 0: the routine already toasted the refusal reason
+            // (dark or gap) — no second Notice, no contradictory wording.
+        }),
         );
 
         // --- Rung 2: the certification surface (writer dark until done) ---

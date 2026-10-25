@@ -2,6 +2,25 @@
 // Vault Overseer — F12: Watcher File-Fact Producers (note.created/deleted)
 // src/fixtures/f12.ts
 //
+// rev C (2026-10-25, B3 reconcile — first-contact backfill + manual button):
+//   - S9  added (NEW): reconcile, fresh spine — empty known-set, 5 vault
+//     paths, all 5 emitted with real stat/sha, tombstones populated (a
+//     subsequent delete of a reconciled path carries the backfilled sha)
+//   - S10 added (NEW): reconcile idempotence — second run with the now-
+//     populated known-set emits ZERO (no per-reload cost)
+//   - S11 added (NEW): partial gap — spine knows 3 of 5, exactly the 2
+//     missing are emitted (the crash-mid-backfill self-heal case)
+//   - S12 added (NEW): dark refusal — reconcile on an unarmed lane
+//     returns -1 and grows the buffer by ZERO (the cap-protection
+//     ruling: backfilling into a 500-cap dark buffer would truncate the
+//     inventory silently-in-principle). Post-arm retry succeeds —
+//     refusal is not poisoning.
+//   - S13 added (NEW): no hidden state — create → delete → reconcile the
+//     same path emits a THIRD fact. The lane keeps no ever-seen dedup;
+//     reconcile is a pure set-diff against the caller's known-set, so a
+//     restored file (spine says dead, disk says alive) reconciles.
+//   - rev B preserved verbatim below (S1–S8, all green 2026-10-25)
+//
 // rev B (2026-10-25, aligned to Schema v0.2 catalog + session rulings):
 //   - S3 reworked: note.deleted now carries last_content_sha (the
 //     tombstone payload) — consumed from the lane's last-known map, so
@@ -19,9 +38,11 @@
 // 80 RED / 88 checks (stub-inflated denominator; true check count 35),
 // all reds legitimate ("module does not exist"). Rev A: ALL GREEN (35
 // checks). Rev B adds S7/S8 — expected first contact RED until the
-// module implements the tombstone map, then green. Hostility
-// satisfied structurally: the stub was incapable of passing
-// green-by-vacuum.
+// module implements the tombstone map, then green. Rev C adds S9–S13 —
+// expected first contact RED against rev B (the lane has no
+// reconcilePaths entry point; the throw is the red) until the module
+// implements reconcile. Hostility satisfied structurally: the stub was
+// incapable of passing green-by-vacuum.
 //
 // CORPUS ENTRY (transcribe into event-log-fixture-corpus.md; F07–F10 are
 // named occupants of the parked list, F12 takes the next free seat):
@@ -32,7 +53,9 @@
 //   seq consumption on silent paths (the F08 poison), stat drift
 //   between observation and flush, tier-of-loss on dark boot, and
 //   Tier-1 facts lost while the writer is dark (identity-uncertified
-//   boot, foreign-origin guard).
+//   boot, foreign-origin guard). Plus (rev C): the installation black
+//   hole — a fresh origin whose spine names no paths, so the heal
+//   projection examines nothing and the vault is invisible.
 //   Setup: spawnContext('mokka') over the FakeAdapter; a WatcherLane
 //   (src/watcher/watch.ts) fed synthetic FileLike events; writer
 //   attached mid-session to exercise dark-boot buffering.
@@ -62,12 +85,19 @@
 //     - Sync-arrival attribution: actor 'user' (DECLARED v1 limitation,
 //       registered roadmap debt — asserted so the limitation is at
 //       least uniform, never intermittent)
+//     - Reconcile (rev C): fresh spine ⇒ every vault path emitted with
+//       real stat/sha and its tombstone populated; second run ⇒ ZERO;
+//       partial spine ⇒ exactly the gaps; unarmed lane ⇒ refusal (-1)
+//       with ZERO buffer growth; create→delete→reconcile ⇒ a third
+//       fact (no hidden ever-seen dedup)
 //   Fail smells: create firing twice for one file; path-keyed dedup
 //   fusing distinct creations; seq advancing on silent paths; note.*
 //   landing in the Tier-2 buffer; stats computed at flush time;
 //   dark-boot facts vanishing without disclosure; empty-array checks
 //   passing vacuously; tombstones fabricating shas for unobserved
-//   paths; overflow dropping NEWEST instead of OLDEST.
+//   paths; overflow dropping NEWEST instead of OLDEST; reconcile
+//   re-emitting known paths (per-reload cost); reconcile running dark
+//   and truncating the inventory through the cap.
 //
 // SCOPE RULING (2026-10-25, session): v1 watcher emits note.created and
 // note.deleted ONLY. note.modified is deferred (storm coalescing,
@@ -117,6 +147,54 @@ function readEvents(
                     shard: string,
 ): Array<Record<string, unknown>> {
     return toLines(fs.read(shard) ?? '').map((l) => JSON.parse(l) as Record<string, unknown>);
+}
+
+/**
+ * Shared fake-deps factory for the reconcile scenarios: a path→stat/sha
+ * map with a loud throw on unknown paths (a lane stat-ing something it
+ * shouldn't is a defect, not a shrug).
+ */
+function statsDeps(
+    tag: string,
+    log: ReturnType<typeof spawnContext>['log'],
+    fakeStats: Map<string, StatSnapshot & { sha: string }>,
+    onAppend?: () => boolean,
+): WatcherDeps {
+    return {
+        stat: async (p) => {
+            const s = fakeStats.get(p);
+            if (s === undefined) throw new Error(`${tag} stat for unknown path ${p}`);
+            return { mtime: s.mtime, bytes: s.bytes };
+        },
+        contentSha: async (p) => {
+            const s = fakeStats.get(p);
+            if (s === undefined) throw new Error(`${tag} sha for unknown path ${p}`);
+            return s.sha;
+        },
+        appendEvent: async (actor, type, payload) => {
+            if (onAppend !== undefined && !onAppend()) return;
+            await log.appendEvent(actor, type, payload);
+        },
+    };
+}
+
+/** Five deterministic vault paths for the reconcile scenarios. */
+const RECONCILE_PATHS = [
+    'Notes/r-1.md',
+'Notes/r-2.md',
+'Notes/r-3.md',
+'Notes/r-4.md',
+'Notes/r-5.md',
+];
+
+function seedReconcileStats(map: Map<string, StatSnapshot & { sha: string }>): void {
+    RECONCILE_PATHS.forEach((p, i) => {
+        map.set(p, {
+            mtime: 1763000400000 + i,
+            bytes: 100 + i,
+            sha: (i + 1).toString(16).padStart(16, '0'),
+        });
+    });
 }
 
 // -----------------------------------------------------------------------------
@@ -544,6 +622,186 @@ async function s8UnknownDelete(): Promise<void> {
 }
 
 // -----------------------------------------------------------------------------
+// S9 — Reconcile: fresh spine, full backfill + tombstone population
+// -----------------------------------------------------------------------------
+
+async function s9ReconcileFresh(): Promise<void> {
+    const ROOT = '/f12-s9';
+    const { log, fs } = spawnContext('mokka', ROOT, { now: () => FIXED_TS });
+    const SHARD = shardPath(ROOT, 'mokka');
+
+    const fakeStats = new Map<string, StatSnapshot & { sha: string }>();
+    seedReconcileStats(fakeStats);
+
+    const lane = makeWatcherLane(statsDeps('S9', log, fakeStats));
+    await lane.flushAfterAttach(); // ARMING — reconcile is an armed-lane op
+
+    // Fresh spine: the caller's known-set is empty. Reconcile emits all.
+    const emitted = await lane.reconcilePaths(RECONCILE_PATHS, new Set<string>());
+
+    check('S9 reconcile emitted all 5', emitted === 5, `${emitted}`);
+
+    const events = readEvents(fs, SHARD);
+    check('S9 five creates on disk', events.length === 5, `${events.length}`);
+    check('S9 all note.created', events.every((e) => e.type === 'note.created'),
+          events.map((e) => e.type).join(','));
+    check('S9 seq contiguous 1..5 (length-guarded)',
+          events.length === 5 && events.every((e, i) => e.seq === i + 1),
+          events.map((e) => e.seq).join(','));
+    check('S9 backfilled payloads carry real stat/sha',
+          events.every((e) => typeof e.mtime === 'number' &&
+          typeof e.bytes === 'number' &&
+          typeof e.content_sha === 'string'),
+          JSON.stringify(events[0] ?? {}));
+
+    // Tombstone population: deleting a reconciled path must carry the
+    // BACKFILLED sha — this is the pre-existing-note tombstone gap, closed.
+    await lane.onVaultDelete(md('Notes/r-3.md'));
+    const after = readEvents(fs, SHARD);
+    const tomb = after.find((e) => e.type === 'note.deleted');
+    check('S9 delete of reconciled path carries last_content_sha',
+          tomb?.last_content_sha === '0000000000000003', `${tomb?.last_content_sha}`);
+
+    await log.dispose();
+}
+
+// -----------------------------------------------------------------------------
+// S10 — Reconcile idempotence: second run emits ZERO
+// -----------------------------------------------------------------------------
+
+async function s10ReconcileIdempotent(): Promise<void> {
+    const ROOT = '/f12-s10';
+    const { log, fs } = spawnContext('mokka', ROOT, { now: () => FIXED_TS });
+    const SHARD = shardPath(ROOT, 'mokka');
+
+    const fakeStats = new Map<string, StatSnapshot & { sha: string }>();
+    seedReconcileStats(fakeStats);
+
+    const lane = makeWatcherLane(statsDeps('S10', log, fakeStats));
+    await lane.flushAfterAttach(); // ARMING
+
+    const first = await lane.reconcilePaths(RECONCILE_PATHS, new Set<string>());
+    check('S10 first reconcile emitted 5', first === 5, `${first}`);
+
+    // The caller now knows all five (spine re-read). Second run is a no-op.
+    const second = await lane.reconcilePaths(RECONCILE_PATHS, new Set(RECONCILE_PATHS));
+    check('S10 second reconcile emitted 0 (idempotent)', second === 0, `${second}`);
+
+    const events = readEvents(fs, SHARD);
+    check('S10 still exactly 5 events (no double-emit)', events.length === 5,
+          `${events.length}`);
+    check('S10 no duplicate paths',
+          new Set(events.map((e) => e.path)).size === 5,
+          `${new Set(events.map((e) => e.path)).size}`);
+
+    await log.dispose();
+}
+
+// -----------------------------------------------------------------------------
+// S11 — Reconcile partial gap: exactly the missing paths
+// -----------------------------------------------------------------------------
+
+async function s11ReconcilePartial(): Promise<void> {
+    const ROOT = '/f12-s11';
+    const { log, fs } = spawnContext('mokka', ROOT, { now: () => FIXED_TS });
+    const SHARD = shardPath(ROOT, 'mokka');
+
+    const fakeStats = new Map<string, StatSnapshot & { sha: string }>();
+    seedReconcileStats(fakeStats);
+
+    const lane = makeWatcherLane(statsDeps('S11', log, fakeStats));
+    await lane.flushAfterAttach(); // ARMING
+
+    // Crash-mid-backfill shape: the spine knows three of the five.
+    const known = new Set(['Notes/r-1.md', 'Notes/r-2.md', 'Notes/r-3.md']);
+    const emitted = await lane.reconcilePaths(RECONCILE_PATHS, known);
+
+    check('S11 emitted exactly the 2 missing', emitted === 2, `${emitted}`);
+
+    const events = readEvents(fs, SHARD);
+    check('S11 two events on disk', events.length === 2, `${events.length}`);
+    check('S11 emitted paths are the gaps',
+          events.length === 2 &&
+          events.every((e) => e.path === 'Notes/r-4.md' || e.path === 'Notes/r-5.md'),
+          events.map((e) => e.path).join(','));
+
+    await log.dispose();
+}
+
+// -----------------------------------------------------------------------------
+// S12 — Reconcile refusal while dark (cap protection)
+// -----------------------------------------------------------------------------
+
+async function s12ReconcileDarkRefusal(): Promise<void> {
+    const ROOT = '/f12-s12';
+    const { log, fs } = spawnContext('mokka', ROOT, { now: () => FIXED_TS });
+    const SHARD = shardPath(ROOT, 'mokka');
+
+    const fakeStats = new Map<string, StatSnapshot & { sha: string }>();
+    seedReconcileStats(fakeStats);
+
+    // NO ARMING — the writer is dark.
+    const lane = makeWatcherLane(statsDeps('S12', log, fakeStats));
+
+    const refused = await lane.reconcilePaths(RECONCILE_PATHS, new Set<string>());
+    check('S12 reconcile refused while dark (-1)', refused === -1, `${refused}`);
+    check('S12 ZERO buffer growth (cap protection)', lane.pendingCount === 0,
+          `pending: ${lane.pendingCount}`);
+    check('S12 nothing written while dark', log.lastSeq === 0, `${log.lastSeq}`);
+
+    // Refusal is not poisoning: arm, then the same call succeeds.
+    await lane.flushAfterAttach();
+    const emitted = await lane.reconcilePaths(RECONCILE_PATHS, new Set<string>());
+    check('S12 post-arm reconcile succeeds', emitted === 5, `${emitted}`);
+
+    const events = readEvents(fs, SHARD);
+    check('S12 five events after arm', events.length === 5, `${events.length}`);
+
+    await log.dispose();
+}
+
+// -----------------------------------------------------------------------------
+// S13 — Reconcile has no hidden state: create → delete → reconcile
+// -----------------------------------------------------------------------------
+
+async function s13ReconcileNoHiddenState(): Promise<void> {
+    const ROOT = '/f12-s13';
+    const { log, fs } = spawnContext('mokka', ROOT, { now: () => FIXED_TS });
+    const SHARD = shardPath(ROOT, 'mokka');
+
+    const P = 'Notes/resurrect.md';
+    const fakeStats = new Map<string, StatSnapshot & { sha: string }>();
+    fakeStats.set(P, { mtime: 1763000500000, bytes: 210, sha: 'feedfacefeedface' });
+
+    const lane = makeWatcherLane(statsDeps('S13', log, fakeStats));
+    await lane.flushAfterAttach(); // ARMING
+
+    // A full lifecycle: the delete CONSUMES the lane's sha entry, so the
+    // lane holds no memory of this path afterwards.
+    await lane.onVaultCreate(md(P));
+    await lane.onVaultDelete(md(P));
+
+    // The file is restored (trash recovery, sync-back). The spine's
+    // LIVE set is empty for this path, so the caller passes an empty
+    // known-set. Reconcile must emit — no ever-seen dedup may suppress it.
+    fakeStats.set(P, { mtime: 1763000600000, bytes: 260, sha: 'beefbeefbeefbeef' });
+    const emitted = await lane.reconcilePaths([P], new Set<string>());
+
+    check('S13 restored path reconciles (no hidden dedup)', emitted === 1, `${emitted}`);
+
+    const events = readEvents(fs, SHARD);
+    check('S13 three facts: created/deleted/created',
+          events.map((e) => e.type).join(',') === 'note.created,note.deleted,note.created',
+          events.map((e) => e.type).join(','));
+    check('S13 reconciled create carries the FRESH sha',
+          events[2]?.content_sha === 'beefbeefbeefbeef', `${events[2]?.content_sha}`);
+    check('S13 reconciled create carries the fresh mtime',
+          events[2]?.mtime === 1763000600000, `${events[2]?.mtime}`);
+
+    await log.dispose();
+}
+
+// -----------------------------------------------------------------------------
 // Registry + main — ONE main call (csuite rule)
 // -----------------------------------------------------------------------------
 
@@ -556,6 +814,11 @@ const SCENARIOS: Array<{ id: string; run: () => Promise<void> }> = [
 { id: 'S6', run: s6SyncAttribution },
 { id: 'S7', run: s7Overflow },
 { id: 'S8', run: s8UnknownDelete },
+{ id: 'S9', run: s9ReconcileFresh },
+{ id: 'S10', run: s10ReconcileIdempotent },
+{ id: 'S11', run: s11ReconcilePartial },
+{ id: 'S12', run: s12ReconcileDarkRefusal },
+{ id: 'S13', run: s13ReconcileNoHiddenState },
 ];
 
 async function main(): Promise<void> {
