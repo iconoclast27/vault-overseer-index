@@ -7,6 +7,31 @@
 // F03 heal scan, and expose the Plugin 2 seam. Everything here is wiring;
 // the spine's semantics live in src/eventlog/*.
 //
+// 0.1.6-bound — WATCHER REGISTRATION DEFERRAL (Option A, 2026-10-25):
+//
+//   The create/delete listeners now register INSIDE
+//   workspace.onLayoutReady (obsidian.d.ts l.10740), per the API's own
+//   instruction in the vault.on('create') doc block (l.10429): "If you
+//   do not wish to receive create events on vault load, register your
+//   event handler inside Workspace.onLayoutReady."
+//
+//   WHY (live-observed 2026-10-25): Obsidian fires vault.on('create')
+//   for EVERY pre-existing file while indexing the vault at boot.
+//   Registration in onload heard the firestorm as user creation —
+//   ~507 note.created per boot on the test vault, recurring on every
+//   reload (shard growth 6974 -> 7487 lines across two boots, plus a
+//   fresh-shard run where the 500-cap dark buffer absorbed the storm
+//   and disclosed 6 dropped facts). The lane was innocent; the adapter
+//   timing was wrong.
+//
+//   DECLARED LIMITATION (Option A, v1): genuine creates arriving in
+//   the onload -> layout-ready window are MISSED. The window exists
+//   only during boot, and nothing downstream starves — the heal scan
+//   indexes content independently of note.created. Option B (deliberate
+//   backfill at arming via getMarkdownFiles(), l.10418) is the ratified
+//   successor: once A is live-verified, the spine gains a controlled,
+//   uncapped first-contact snapshot so a fresh shard learns the world.
+//
 // 0.1.5-bound — RENAME WIRING (F05a, ratified 2026-10-24):
 //
 //   The plugin's second vault event: 'rename' — vault.on('rename',
@@ -23,8 +48,8 @@
 //                'user' — the rename is the human's act, recorded
 //                by instrument). Drops while the writer is dark,
 //                like every adapter emission (declared v1
-//                limitation). The gate's lanes are rewritten in
-//                the same handler, so in-flight accrual and future
+//                limitation). The gate's lanes are rewritten in the
+//                same handler, so in-flight accrual and future
 //                emissions name the new path.
 //   - TFolder => gate.renamePrefix(oldPath, file.path): a folder
 //                rename mass-invalidates every storage address under
@@ -72,7 +97,8 @@
 //   Farewell ordering doctrine, unchanged: onunload() is SYNCHRONOUS
 //   and enqueues farewell dwell events into the serialized write
 //   queue BEFORE dispose() is called — the queue's serialization,
-//   plus this ordering, makes the race structurally impossible.
+//   plus this ordering, makes the farewell race structurally
+//   impossible.
 //
 // 0.1.3-bound — F03 HEAL SCAN WIRING (ratified 2026-10-23):
 //
@@ -159,6 +185,10 @@
 //   — obsidian.d.ts l.10451. Verified 2026-10-24. TFolder instanceof
 //   disambiguates; folder renames arrive on the same event (no
 //   separate folder-rename hook exists).
+//   onLayoutReady(callback: () => any): void — obsidian.d.ts l.10740,
+//   with the create-at-load guidance at l.10429. Verified 2026-10-25.
+//   getMarkdownFiles(): TFile[] — obsidian.d.ts l.10418. Verified
+//   2026-10-25 (Option B ammunition, unused in Option A).
 //
 // 0.1.2 — CHAIN-VERIFICATION REPORT FOLD (ratified 2026-10-23):
 //
@@ -523,15 +553,34 @@ export default class VaultOverseerIndex extends Plugin {
             this.app.vault.on('rename', (file, oldPath) => this.onVaultRename(file, oldPath)),
         );
 
-        // Watcher wiring (F12, 2026-10-25). Same registerEvent doctrine:
-        // tracked even while the writer is dark; emissions drop silently
-        // until flushAfterAttach() is called at the end of startWriter.
-        this.registerEvent(
-            this.app.vault.on('create', (file) => this.onVaultCreate(file)),
-        );
-        this.registerEvent(
-            this.app.vault.on('delete', (file) => this.onVaultDelete(file)),
-        );
+        // Watcher wiring (F12, 2026-10-25) — DEFERRED to layout-ready
+        // (Option A). Per the API's own guidance in the vault.on
+        // ('create') doc block (obsidian.d.ts l.10429), registering the
+        // create handler in onload hears the boot-indexing firestorm —
+        // one 'create' per pre-existing file — as user creation (live
+        // observed 2026-10-25: ~507 note.created per boot, recurring
+        // every reload). onLayoutReady (l.10740) fires after indexing,
+        // so the listeners wake into a quiet vault and hear only real
+        // events.
+        //
+        // DECLARED LIMITATION (Option A, v1): a genuine create landing
+        // between onload and layout-ready is missed — boot-window
+        // only, nothing downstream starves (heal indexes content
+        // independently). Option B (deliberate first-contact backfill
+        // via getMarkdownFiles(), l.10418) follows once A is verified.
+        //
+        // registerEvent inside the callback still books cleanup for
+        // unload; onLayoutReady runs the callback immediately when the
+        // layout is already ready (reload-plugin path), so no
+        // registration is ever skipped.
+        this.app.workspace.onLayoutReady(() => {
+            this.registerEvent(
+                this.app.vault.on('create', (file) => this.onVaultCreate(file)),
+            );
+            this.registerEvent(
+                this.app.vault.on('delete', (file) => this.onVaultDelete(file)),
+            );
+        });
 
         this.addSettingTab(new OverseerSettingTab(this.app, this));
     }
@@ -625,9 +674,9 @@ export default class VaultOverseerIndex extends Plugin {
 
     /**
      * Vault create receipt: filter to md files, forward to the lane.
-     * Drops silently while dark; the lane buffers facts at observation
-     * time (mtime/bytes/sha frozen then, even if the file changes
-     * before flush — stat-drift trap avoided).
+     * Registered at layout-ready (Option A) — see onload. The lane
+     * stats at observation time (mtime/bytes/sha frozen then, even if
+     * the file changes before flush — stat-drift trap avoided).
      */
     private async onVaultCreate(file: TAbstractFile): Promise<void> {
         if (!(file instanceof TFile)) return;
@@ -778,6 +827,10 @@ export default class VaultOverseerIndex extends Plugin {
         // ARMING: the writer is up, drain the dark buffer and arm the
         // watcher lane live. Overflow disclosure (if any) precedes the
         // drained facts; the spill is named before the survivors land.
+        // Under Option A this buffer should be EMPTY at arming on a
+        // normal boot (listeners register at layout-ready, after the
+        // firestorm); the dark path remains for the Rung-2
+        // certification-late edge.
         void this.watcherLane.flushAfterAttach();
     }
 

@@ -1116,12 +1116,14 @@ var VaultOverseerIndex = class extends import_obsidian.Plugin {
     this.registerEvent(
       this.app.vault.on("rename", (file, oldPath) => this.onVaultRename(file, oldPath))
     );
-    this.registerEvent(
-      this.app.vault.on("create", (file) => this.onVaultCreate(file))
-    );
-    this.registerEvent(
-      this.app.vault.on("delete", (file) => this.onVaultDelete(file))
-    );
+    this.app.workspace.onLayoutReady(() => {
+      this.registerEvent(
+        this.app.vault.on("create", (file) => this.onVaultCreate(file))
+      );
+      this.registerEvent(
+        this.app.vault.on("delete", (file) => this.onVaultDelete(file))
+      );
+    });
     this.addSettingTab(new OverseerSettingTab(this.app, this));
   }
   // ---------------------------------------------------------------------------
@@ -1198,9 +1200,9 @@ var VaultOverseerIndex = class extends import_obsidian.Plugin {
   // ---------------------------------------------------------------------------
   /**
    * Vault create receipt: filter to md files, forward to the lane.
-   * Drops silently while dark; the lane buffers facts at observation
-   * time (mtime/bytes/sha frozen then, even if the file changes
-   * before flush — stat-drift trap avoided).
+   * Registered at layout-ready (Option A) — see onload. The lane
+   * stats at observation time (mtime/bytes/sha frozen then, even if
+   * the file changes before flush — stat-drift trap avoided).
    */
   async onVaultCreate(file) {
     if (!(file instanceof import_obsidian.TFile)) return;
