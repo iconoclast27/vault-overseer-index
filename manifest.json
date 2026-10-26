@@ -1,7 +1,7 @@
 {
   "id": "vault-overseer-index",
   "name": "Vault Overseer Index",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "minAppVersion": "1.4.4",
   "description": "Local-first semantic index and event-log spine for your vault.",
   "author": "Dan",
