@@ -560,43 +560,272 @@ function renderEmbedInput(taskPrefix, headingChain, fmContext, chunkText) {
 function embedVh(embedInput) {
   return sha16(Buffer.from(embedInput, "utf-8"));
 }
-
-// src/chunker/stub.ts
-var STUB_CP = 0;
-var STUB_CHUNK_BYTES = 512;
-function chunkStub(fileBytes) {
-  const chunks = [];
-  let spanStart = 0;
-  let spanEnd = 0;
-  let spanBytes = 0;
-  const flush = () => {
-    if (spanBytes === 0) return;
-    const text = Buffer.from(fileBytes.subarray(spanStart, spanEnd)).toString("utf-8");
-    chunks.push({
-      ord: chunks.length,
-      bs: spanStart,
-      be: spanEnd,
-      vh: embedVh(renderEmbedInput("search_document:", [], null, text)),
-      cp: STUB_CP
-    });
-    spanBytes = 0;
-  };
-  let i = 0;
-  while (i < fileBytes.length) {
-    const nl = fileBytes.indexOf(10, i);
-    const lineEnd = nl === -1 ? fileBytes.length : nl + 1;
-    const lineLen = lineEnd - i;
-    if (spanBytes > 0 && spanBytes + lineLen > STUB_CHUNK_BYTES) flush();
-    if (spanBytes === 0) spanStart = i;
-    i = lineEnd;
-    spanEnd = lineEnd;
-    spanBytes += lineLen;
+var SELECTED_KEYS = /* @__PURE__ */ new Set(["aliases", "description", "tags", "type"]);
+var KEY_RE = /^[A-Za-z_][A-Za-z0-9_-]*:/;
+var DASH_ITEM_RE = /^\s+-\s?(.*)$/;
+function stripQuotes(s) {
+  if (s.length >= 2 && (s.startsWith('"') && s.endsWith('"') || s.startsWith("'") && s.endsWith("'"))) {
+    return s.slice(1, -1).trim();
   }
-  flush();
-  return chunks;
+  return s;
+}
+function assign(fm, key, value) {
+  if (key === "aliases") fm.aliases = value;
+  else if (key === "tags") fm.tags = value;
+  else if (key === "description") fm.description = value;
+  else if (key === "type") fm.type = value;
+}
+function parseInlineValue(rest) {
+  if (rest.startsWith("[") && rest.endsWith("]")) {
+    const inner = rest.slice(1, -1).trim();
+    if (inner === "") return [];
+    return inner.split(",").map((s) => stripQuotes(s.trim())).filter((s) => s !== "");
+  }
+  return stripQuotes(rest);
+}
+function parseFmContext(blockText) {
+  const fm = {};
+  const lines = blockText.split("\n").map((l) => l.replace(/\r$/, ""));
+  const seen = /* @__PURE__ */ new Set();
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (!KEY_RE.test(line)) {
+      i++;
+      continue;
+    }
+    const colon = line.indexOf(":");
+    const key = line.slice(0, colon);
+    const rest = line.slice(colon + 1).trim();
+    const isDashListHead = rest === "";
+    const items = [];
+    let j = i + 1;
+    while (j < lines.length) {
+      const dm = DASH_ITEM_RE.exec(lines[j]);
+      if (dm === null) break;
+      items.push(stripQuotes(dm[1].trim()));
+      j++;
+    }
+    if (seen.has(key) || !SELECTED_KEYS.has(key)) {
+      i = j;
+      continue;
+    }
+    seen.add(key);
+    if (isDashListHead) {
+      if (items.length > 0) assign(fm, key, items);
+    } else {
+      assign(fm, key, parseInlineValue(rest));
+    }
+    i = j;
+  }
+  return fm;
+}
+
+// src/chunker/chunker.ts
+var CHUNKER_CP = 2;
+var TARGET_BYTES = 2048;
+var CEILING_BYTES = 3072;
+var BOM = [239, 187, 191];
+function lineEnd(bytes, from) {
+  const nl = bytes.indexOf(10, from);
+  return nl === -1 ? bytes.length : nl + 1;
+}
+function decodeLine(bytes, bs, be) {
+  return Buffer.from(bytes.subarray(bs, be)).toString("utf-8").replace(/\r$/, "");
+}
+function isWhitespaceByte(b) {
+  return b === 32 || b === 9 || b === 10 || b === 13;
+}
+function partitionFrontmatter(bytes, start) {
+  const firstLe = lineEnd(bytes, start);
+  if (decodeLine(bytes, start, firstLe).trim() !== "---") {
+    return { fm: null, bodyStart: start };
+  }
+  let i = firstLe;
+  while (i < bytes.length) {
+    const le = lineEnd(bytes, i);
+    if (decodeLine(bytes, i, le).trim() === "---") {
+      const blockText = Buffer.from(bytes.subarray(firstLe, i)).toString("utf-8");
+      return { fm: parseFmContext(blockText), bodyStart: le };
+    }
+    i = le;
+  }
+  return { fm: null, bodyStart: start };
+}
+var HEADING_RE = /^(#{1,6})(?:\s+(.*))?$/;
+function walkParagraphs(bytes, bodyStart) {
+  const paras = [];
+  let chain = [];
+  let inFence = false;
+  let afterHeading = true;
+  let cur = null;
+  const close = () => {
+    if (cur !== null) {
+      paras.push(cur);
+      cur = null;
+    }
+  };
+  let i = bodyStart;
+  while (i < bytes.length) {
+    const le = lineEnd(bytes, i);
+    const t = decodeLine(bytes, i, le).trim();
+    const startsFence = t.startsWith("```");
+    if (inFence) {
+      if (startsFence) inFence = false;
+      cur.be = le;
+    } else if (startsFence) {
+      inFence = true;
+      close();
+      cur = { bs: i, be: le, chain: [...chain], afterHeading, kind: "atomic" };
+      afterHeading = false;
+    } else if (t === "") {
+      close();
+    } else {
+      const h = HEADING_RE.exec(t);
+      if (h !== null) {
+        close();
+        const level = h[1].length;
+        chain = chain.slice(0, level - 1);
+        chain.push((h[2] ?? "").trim());
+        afterHeading = true;
+      } else if (cur !== null) {
+        cur.be = le;
+      } else {
+        const kind = t.startsWith("|") ? "atomic" : "text";
+        cur = { bs: i, be: le, chain: [...chain], afterHeading, kind };
+        afterHeading = false;
+      }
+    }
+    i = le;
+  }
+  close();
+  return paras;
+}
+function sentenceBoundaries(bytes, s, e) {
+  const out = [];
+  for (let i = s; i < e; i++) {
+    const b = bytes[i];
+    let termLen = 0;
+    if (b === 46 || b === 33 || b === 63) termLen = 1;
+    else if (b === 227 && bytes[i + 1] === 128 && bytes[i + 2] === 130) termLen = 3;
+    else if (b === 239 && bytes[i + 1] === 188 && (bytes[i + 2] === 129 || bytes[i + 2] === 159)) termLen = 3;
+    if (termLen === 0) continue;
+    const after = i + termLen;
+    if (after >= e || isWhitespaceByte(bytes[after])) {
+      out.push(after);
+      i = after - 1;
+    }
+  }
+  return out;
+}
+function wordBoundaries(bytes, s, e) {
+  const out = [];
+  let i = s;
+  while (i < e) {
+    if (isWhitespaceByte(bytes[i])) {
+      let j = i;
+      while (j < e && isWhitespaceByte(bytes[j])) j++;
+      if (j < e) out.push(j);
+      i = j;
+    } else {
+      i++;
+    }
+  }
+  return out;
+}
+function utf8SafeCut(bytes, limit) {
+  while ((bytes[limit] & 192) === 128) limit--;
+  return limit;
+}
+function splitRange(bytes, s, e, level, carves) {
+  const lengths = [];
+  if (level === "byte") {
+    let pos = s;
+    while (e - pos > CEILING_BYTES) {
+      const cut = utf8SafeCut(bytes, pos + CEILING_BYTES);
+      lengths.push(cut - pos);
+      carves.push({ bs: pos, be: e, reason: "over-ceiling-byte-carved" });
+      pos = cut;
+    }
+    if (e > pos) lengths.push(e - pos);
+    return lengths;
+  }
+  const units = level === "sentence" ? sentenceBoundaries(bytes, s, e) : wordBoundaries(bytes, s, e);
+  const all = [...units];
+  if (all[all.length - 1] !== e) all.push(e);
+  let pieceStart = s;
+  let prev = s;
+  for (const k of all) {
+    const unitLen = k - prev;
+    if (unitLen > CEILING_BYTES) {
+      if (prev > pieceStart) lengths.push(prev - pieceStart);
+      lengths.push(...splitRange(bytes, prev, k, level === "sentence" ? "word" : "byte", carves));
+      pieceStart = k;
+    } else if (k - pieceStart > TARGET_BYTES && prev > pieceStart) {
+      lengths.push(prev - pieceStart);
+      pieceStart = prev;
+    }
+    prev = k;
+  }
+  if (e > pieceStart) lengths.push(e - pieceStart);
+  return lengths;
+}
+function chunkNote(fileBytes) {
+  const hadBom = fileBytes.length >= 3 && fileBytes[0] === BOM[0] && fileBytes[1] === BOM[1] && fileBytes[2] === BOM[2];
+  const start = hadBom ? 3 : 0;
+  const { fm, bodyStart } = partitionFrontmatter(fileBytes, start);
+  const paras = walkParagraphs(fileBytes, bodyStart);
+  const carves = [];
+  const drafts = [];
+  let cur = null;
+  for (const p of paras) {
+    const plen = p.be - p.bs;
+    if (plen > CEILING_BYTES) {
+      if (cur !== null) {
+        drafts.push(cur);
+        cur = null;
+      }
+      let pos = p.bs;
+      for (const len of splitRange(
+        fileBytes,
+        p.bs,
+        p.be,
+        p.kind === "atomic" ? "byte" : "sentence",
+        carves
+      )) {
+        drafts.push({ bs: pos, be: pos + len, chain: p.chain });
+        pos += len;
+      }
+      continue;
+    }
+    if (p.afterHeading && cur !== null) {
+      drafts.push(cur);
+      cur = null;
+    }
+    if (cur !== null && p.be - cur.bs <= TARGET_BYTES) {
+      cur.be = p.be;
+    } else {
+      if (cur !== null) drafts.push(cur);
+      cur = { bs: p.bs, be: p.be, chain: p.chain };
+    }
+  }
+  if (cur !== null) drafts.push(cur);
+  const chunks = drafts.map((d, ord) => {
+    const text = Buffer.from(fileBytes.subarray(d.bs, d.be)).toString("utf-8");
+    return {
+      ord,
+      bs: d.bs,
+      be: d.be,
+      vh: embedVh(renderEmbedInput("search_document:", d.chain, fm, text)),
+      cp: CHUNKER_CP,
+      chain: d.chain
+    };
+  });
+  return { chunks, carves, hadBom, fm };
 }
 
 // src/eventlog/heal.ts
+var HOME_CP = 2;
 async function healScan(log, source, eventsDir) {
   const scan = await mergeScan(source, eventsDir);
   if (scan.gaps.length > 0) {
@@ -641,11 +870,12 @@ async function healScan(log, source, eventsDir) {
       continue;
     }
     const sha = contentSha(bytes);
+    const derived = chunkNote(bytes);
     const haveVh = new Set(
       (existingChunks.get(path) ?? []).map((c) => String(c.vh))
     );
     let emitted = 0;
-    for (const chunk of chunkStub(bytes)) {
+    for (const chunk of derived.chunks) {
       if (haveVh.has(chunk.vh)) {
         result.vhDeduped++;
         continue;
@@ -658,6 +888,7 @@ async function healScan(log, source, eventsDir) {
         vh: chunk.vh,
         cp: chunk.cp
       });
+      haveVh.add(chunk.vh);
       emitted++;
       result.chunksReemitted++;
     }
@@ -665,26 +896,28 @@ async function healScan(log, source, eventsDir) {
       await log.reportIntegrity(
         `buffer window lost, ${emitted} events re-derived from sha (path: ${path}, content_sha: ${sha})`
       );
+      for (const carve of derived.carves) {
+        await log.reportIntegrity(
+          `chunk.carve path="${path}" reason=${carve.reason} paragraph_end=${carve.be} pieces=${derived.chunks.length}`
+        );
+      }
     }
     for (const rec of existingChunks.get(path) ?? []) {
       const cp = Number(rec.cp);
-      if (cp !== 0) {
+      if (cp !== HOME_CP) {
         result.p1Skipped++;
         await log.reportIntegrity(
           `p1 skipped: unknown chunk policy (path: ${path}, ord: ${rec.ord}, cp: ${cp}) \u2014 verification owed to the policy's owner`
         );
         continue;
       }
-      const bs = Number(rec.bs);
-      const be = Number(rec.be);
-      const text = Buffer.from(bytes.subarray(bs, be)).toString("utf-8");
-      const recomputed = embedVh(
-        renderEmbedInput("search_document:", [], null, text)
+      const derivable = derived.chunks.some(
+        (c) => c.vh === String(rec.vh)
       );
-      if (recomputed !== String(rec.vh)) {
+      if (!derivable) {
         result.p1Failures++;
         await log.reportIntegrity(
-          `p1 violation: offsets fail to reproduce text (path: ${path}, ord: ${rec.ord}, bs: ${bs}, be: ${be})`
+          `p1 violation: recorded vh no longer derivable (path: ${path}, ord: ${rec.ord}, vh: ${rec.vh}) \u2014 chunk eviction owed to the real chunker, not improvised here`
         );
       }
     }

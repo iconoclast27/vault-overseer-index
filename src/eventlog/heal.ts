@@ -6,21 +6,43 @@
 // and Tier-2 derivatives re-derive from the vault's own bytes. The heal
 // scan is that re-derivation: one rescan, idempotent, self-logging.
 //
-// Contract (corpus F03):
+// Contract (corpus F03, rev C):
 //   - Tier-1 events are never touched — facts survive, full stop.
 //   - Every note path known from Tier-1 events is re-chunked against
-//     PRESENT-DAY file bytes. Re-derived chunk.indexed events whose vh
-//     already exists in the projection for that path are skipped
-//     (idempotence — "the vh collision must not double-emit").
-//   - Every pre-existing chunk.indexed event is P1-verified against
-//     present-day bytes: file_bytes.slice(bs, be) must reproduce a vh
-//     equal to the recorded one. Violations are log.integrity, not
-//     silent drift.
-//   - P1 vh-recompute is only valid for chunks the heal KNOWS how to
-//     render. cp: 0 re-renders via the stub shape (empty chain, no fm).
-//     Foreign cp values are skipped WITH DISCLOSURE — a skipped check
-//     is a named skip, never a silent one. Recomputing an unknown cp
-//     with a known policy would fabricate false P1 violations.
+//     PRESENT-DAY file bytes with the PRODUCTION chunker (chunkNote,
+//     cp: 2 — migration 2026-10-26, closing the registered debt "heal
+//     must migrate off the stub before mixed-cp shards exist").
+//     Re-derived chunk.indexed events whose vh already exists in the
+//     projection for that path are skipped (idempotence — "the vh
+//     collision must not double-emit"). Dedup holds WITHIN a pass as
+//     well as against the spine: identical chunks (repeated boilerplate
+//     paragraphs) share a vh, and that vh emits exactly once — earned
+//     by F03 scenario twin-vh (2026-10-26 errata).
+//   - CARVE DISCLOSURE: chunkNote's carves (over-ceiling paragraphs cut
+//     at sentence/word/UTF-8 boundaries) are owed log.integrity lines —
+//     the chunker's contract says silence disqualifies. Disclosure is
+//     TIED TO NOVEL EMISSION: a heal that re-derives only known vhs
+//     does not re-complain, or every boot would re-litigate the same
+//     carve (the corpse-report lesson, applied). A partial-novelty
+//     pass discloses the chunker's full carve list for that note —
+//     the carve describes the derivation, not the delta.
+//   - P1 VERIFICATION (rev C semantics: MEMBERSHIP): for pre-existing
+//     cp:2 records, every recorded vh on a live path must appear among
+//     the vhs freshly derived from present-day bytes. The old offset-
+//     math re-render (slice + re-hash) is UNSOUND for cp:2 — chain and
+//     fm_context are not in the log BY DESIGN (metadata-only output
+//     contract), so a recorded span cannot be re-rendered in isolation.
+//     Membership is the sound replacement and a SUPERSET of the old
+//     check: reordered frontmatter or an inserted heading yields a
+//     different vh ⇒ un-derivable ⇒ violation. That is correct, not
+//     noisy — different bytes are different content. Eviction of stale
+//     records (chunk.evicted) remains parked with the real chunker.
+//   - Foreign cp values (anything ≠ 2, including stub-era cp: 0) are
+//     skipped WITH DISCLOSURE — a skipped check is a named skip, never
+//     a silent one. Recomputing an unknown cp with a known policy
+//     would fabricate false P1 violations. cp: 0 stub-era records are
+//     forensic truth; they are skipped loudly every heal until a
+//     retirement/migration tool exists (registered debt).
 //   - Heal logs itself: "buffer window lost, N events re-derived from
 //     sha" — only when re-derivation actually emitted something.
 //
@@ -30,10 +52,10 @@
 // operates on a CONTIGUOUS spine only.
 //
 // Migration note 2026-10-22: renderEmbedInput now lives in
-// ../chunker/render.ts (single-implementation rule) and takes FOUR
-// arguments (prefix, chain, fm, text). This file imports it from there
-// and renders with the stub shape (empty chain, null fm) — byte-for-byte
-// what the old three-argument stub call produced.
+// ../chunker/render.ts (single-implementation rule). Superseded for
+// this file by the 2026-10-26 migration: heal no longer re-renders
+// embed inputs at all — P1 is membership against chunkNote's fresh
+// derivation (see above).
 //
 // Migration note 2026-10-25: the path projection moved to ./projection.ts
 // (single-implementation rule — reconcile and the index projection seam
@@ -45,27 +67,54 @@
 // F03 scenario corpse-suppress is the fixture earning this). A path the
 // spine says is dead heals to silence; its tombstone IS the record.
 //
+// Migration note 2026-10-26: the chunker dependency moved from the stub
+// (cp: 0, fixture-grade line packer) to chunkNote (cp: 2, production
+// paragraph/heading-chain/frontmatter chunker). contentSha now imports
+// from render.ts directly — the stub's last production consumer is
+// gone; only fixtures reference it. The stub is retired in deed, file
+// deletion pending fixture cleanup.
+//
+// Errata note 2026-10-26 (post first contact): within-pass dedup added.
+// The emission loop now records each emitted vh into haveVh, so a
+// second chunk sharing that vh in the same derivation collides instead
+// of emitting a duplicate. Earned by F03 scenario twin-vh; the original
+// rev C world (homogeneous filler) hid this because its degenerate
+// worlds never exercised a legitimate twin.
+//
 // Scope notes (owed, visible):
 //   - chunk.evicted for stale vhs whose offsets no longer reproduce:
 //     parked with the real chunker (sha-drift is its neighbor, F05).
+//     A stale vh is detected (P1 violation) but never evicted here.
 //   - Missing note files are reported loudly and skipped — eviction
 //     is not improvised here.
+//   - Carve detail strings are heal-local, not shared with the
+//     indexer's emit.ts carveDetail: the indexer lives DOWNSTREAM of
+//     the log (it imports eventlog types), so importing it from here
+//     would invert the dependency direction. Format keeps the indexer's
+//     vocabulary (leading "chunk.carve", key=value pairs) but omits
+//     the piece-pairing fields — heal re-derives fresh and cannot
+//     honestly pair carves to pieces in a mixed note (the indexer's
+//     own pairing is flagged inference there). Declared limitation,
+//     not silent divergence.
 // =============================================================================
 
 import type { EventLog } from './eventlog.ts';
 import { mergeScan, type ByteSource, type ParsedLine } from './reader.ts';
 import { projectPaths } from './projection.ts';
-import { chunkStub, contentSha } from '../chunker/stub.ts';
-import { embedVh, renderEmbedInput } from '../chunker/render.ts';
+import { chunkNote } from '../chunker/chunker.ts';
+import { contentSha } from '../chunker/render.ts';
+
+/** Chunk policy heal treats as HOME. Anything else: loud skip, never verify. */
+const HOME_CP = 2;
 
 export interface HealResult {
     /** Note paths examined (Tier-1-known). */
     pathsExamined: number;
     /** chunk.indexed events emitted (re-derivation). */
     chunksReemitted: number;
-    /** vh collisions skipped — the idempotence counter. */
+    /** vh collisions skipped — the idempotence counter (within-pass + spine). */
     vhDeduped: number;
-    /** Pre-existing chunks failing P1 verification. */
+    /** Pre-existing chunks failing P1 verification (membership). */
     p1Failures: number;
     /** Pre-existing chunks P1-skipped due to unknown chunk policy. */
     p1Skipped: number;
@@ -127,12 +176,17 @@ export async function healScan(
         }
         const sha = contentSha(bytes);
 
-        // Re-derive: chunk present-day bytes, emit only novel vhs.
+        // Re-derive with the PRODUCTION chunker. Determinism (P3/F04)
+        // is what makes the fresh derivation comparable to records.
+        const derived = chunkNote(bytes);
+
+        // Emit only novel vhs — idempotence gate. haveVh is mutated as
+        // we emit, so twins within this pass dedup too (errata 2026-10-26).
         const haveVh = new Set<string>(
             (existingChunks.get(path) ?? []).map((c) => String(c.vh)),
         );
         let emitted = 0;
-        for (const chunk of chunkStub(bytes)) {
+        for (const chunk of derived.chunks) {
             if (haveVh.has(chunk.vh)) {
                 result.vhDeduped++;
                 continue;
@@ -145,6 +199,7 @@ export async function healScan(
                 vh: chunk.vh,
                 cp: chunk.cp,
             });
+            haveVh.add(chunk.vh); // within-pass dedup: twins collide here
             emitted++;
             result.chunksReemitted++;
         }
@@ -154,15 +209,23 @@ export async function healScan(
                 `buffer window lost, ${emitted} events re-derived from sha ` +
                 `(path: ${path}, content_sha: ${sha})`,
             );
+            // Carve disclosure — only when this pass actually emitted.
+            // Silence on an all-dedupe pass is correct idempotence,
+            // not a missing report (see contract, carve disclosure).
+            for (const carve of derived.carves) {
+                await log.reportIntegrity(
+                    `chunk.carve path="${path}" reason=${carve.reason} ` +
+                    `paragraph_end=${carve.be} pieces=${derived.chunks.length}`,
+                );
+            }
         }
 
-        // P1: police pre-existing chunks against present-day bytes.
+        // P1 (membership): every recorded vh on this live path must be
+        // derivable from present-day bytes. Foreign policy: loud skip.
+        // Recomputing an unknown policy's vh would fabricate failures.
         for (const rec of existingChunks.get(path) ?? []) {
             const cp = Number(rec.cp);
-            if (cp !== 0) {
-                // Unknown policy: heal cannot faithfully re-render this
-                // chunk's embed input, so it cannot verify the vh. Loud
-                // skip, never a fabricated failure.
+            if (cp !== HOME_CP) {
                 result.p1Skipped++;
                 await log.reportIntegrity(
                     `p1 skipped: unknown chunk policy ` +
@@ -171,17 +234,15 @@ export async function healScan(
                 );
                 continue;
             }
-            const bs = Number(rec.bs);
-            const be = Number(rec.be);
-            const text = Buffer.from(bytes.subarray(bs, be)).toString('utf-8');
-            const recomputed = embedVh(
-                renderEmbedInput('search_document:', [], null, text),
+            const derivable = derived.chunks.some(
+                (c) => c.vh === String(rec.vh),
             );
-            if (recomputed !== String(rec.vh)) {
+            if (!derivable) {
                 result.p1Failures++;
                 await log.reportIntegrity(
-                    `p1 violation: offsets fail to reproduce text ` +
-                    `(path: ${path}, ord: ${rec.ord}, bs: ${bs}, be: ${be})`,
+                    `p1 violation: recorded vh no longer derivable ` +
+                    `(path: ${path}, ord: ${rec.ord}, vh: ${rec.vh}) — ` +
+                    `chunk eviction owed to the real chunker, not improvised here`,
                 );
             }
         }
