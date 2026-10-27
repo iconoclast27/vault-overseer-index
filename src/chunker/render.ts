@@ -20,9 +20,12 @@
 //     CHUNK_TEXT — chunk bytes decoded, as-is.
 //
 //   EQUIVALENCE GUARANTEE: (prefix, [], null, text) renders EXACTLY as
-//   the stub's old three-part form. Every cp:0 vh survives this module
-//   replacing the stub's private copy, byte-identical. Fixture rerun
-//   confirms — probable until proven.
+//   the stub's old three-part form did. Every cp:0 vh that existed
+//   before the migration survived this module replacing the stub's
+//   private copy, byte-identically — fixture rerun confirmed. The
+//   guarantee is now historical: the stub was deleted 2026-10-27, so
+//   no new cp:0 vhs can be minted. Fresh-shard recertification
+//   (Phase 3) verified the cp:2 lane alone.
 //
 // fm_context canonical form: compact JSON, keys alphabetical (aliases,
 // description, tags, type), strings trimmed, arrays element-trimmed.

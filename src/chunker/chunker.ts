@@ -3,8 +3,10 @@
 // src/chunker/chunker.ts
 //
 // Chunk policy version 2: paragraph-level, heading-chained,
-// frontmatter-stamped. Supersedes the stub's geometry entirely —
-// mixed cp in a projection means re-chunk required (schema).
+// frontmatter-stamped. Replaced the cp: 0 stub's line-packed geometry
+// at migration (2026-10-26); the stub itself was deleted 2026-10-27
+// (Phase 4, after F03 rev D severed its last dependency). Mixed cp in
+// a projection means re-chunk required (schema).
 //
 // CHANGELOG cp: 1 → 2 (2026-10-22, finding B / C02(b)):
 //   walkParagraphs: a fence opener now ALWAYS closes the in-flight

@@ -4,6 +4,17 @@
 // Generated: 2026-10-22T11:35:00+01:00
 // Rev B: 2026-10-25 — corpse suppression (delete/rename-away paths not re-chunked)
 // Rev C: 2026-10-26 — heal→chunkNote migration (cp:0 → cp:2), RED-EARNING.
+// Rev D: 2026-10-27 — STUB SEVERED (Phase 4). contentSha now imported from
+//   render.ts (its single-implementation home); the legacy scenario is
+//   re-christened foreign-cp0 and re-seeded with SYNTHETIC records: cp:0,
+//   plausible chunkNote offsets, and UN-DERIVABLE sha16-shaped garbage vhs.
+//   Rationale: no pre-0.1.6 shard exists or ever will (private plugin, Dan's
+//   ruling, 2026-10-27) — so cp:0 survives purely as the foreign-policy
+//   probe's arbitrary costume, never a claim about real history. Teeth are
+//   STRONGER than the stub-era seeding: a heal that forgot to skip a foreign
+//   record would run P1 membership on an un-derivable vh and fabricate a
+//   violation — the p1Failures === 0 assertion would go RED. The stub-vs-real
+//   geometry vacuity check retired along with the stub dependency.
 //
 // REV C ERRATA (2026-10-26, post first contact): the original rev C world
 // used homogeneous filler — every paragraph identical '=' bytes. Under
@@ -55,16 +66,16 @@
 //                 is fresh-derivation MEMBERSHIP — every recorded vh
 //                 on a live path must be derivable from present-day
 //                 bytes. Stale vh ⇒ p1 violation, loudly, every heal.
-//   legacy-cp0  — a healthy stub-era record set (cp:0): post-migration
-//                 heal treats cp:0 as a FOREIGN policy — loud skip
-//                 with disclosure, never a fabricated verification.
-//   twin-vh (NEW, errata) — a homogeneous note: chunkNote yields
+//   foreign-cp0 — synthetic cp:0 records with UN-DERIVABLE vhs (rev D,
+//                 stub severed): heal treats cp ≠ 2 as a FOREIGN policy —
+//                 loud skip with disclosure, never a fabricated verification.
+//   twin-vh (rev C errata) — a homogeneous note: chunkNote yields
 //                 multiple chunks sharing one vh. Heal must emit that
 //                 vh exactly ONCE per pass (within-pass dedup), the
 //                 shard must hold exactly one record for it, and the
 //                 second heal must find only collisions.
 //
-// Pass requires (corpus F03, rev C):
+// Pass requires (corpus F03, rev D):
 //   1. Tier-1 facts present exactly once — facts survived, full stop
 //   2. The Tier-2 events absent from disk at kill time (canonical)
 //   3. Heal re-derives all of them, field-identical to chunkNote output,
@@ -78,7 +89,7 @@
 //   8. CORPSE SUPPRESSION: heal examines 1 path (Gamma), not 4
 //   9. CARVE DISCLOSURE: over-ceiling fences carve with log.integrity
 //      lines; count matches chunkNote's own disclosure
-//  10. LEGACY cp:0: skipped loudly, never verified, never fabricated
+//  10. FOREIGN cp:0: skipped loudly, never verified, never fabricated
 //  11. TWIN VH: identical chunks emit exactly once per pass (dedup
 //      holds WITHIN a derivation, not just against the spine)
 //
@@ -97,7 +108,7 @@ import { FakeFileSystem, FakeAdapter, spawnContext, shardPath } from '../test-ha
 import { startupChecks, mergeScan } from '../eventlog/reader.ts';
 import { healScan } from '../eventlog/heal.ts';
 import { chunkNote } from '../chunker/chunker.ts';
-import { chunkStub, contentSha } from '../chunker/stub.ts';
+import { contentSha } from '../chunker/render.ts';
 
 const ROOT = '/f03';
 const DIR = '_vault-index/events';
@@ -505,7 +516,7 @@ async function scenarioCorpseSuppress(): Promise<void> {
       await h.ctx.log.dispose();
 }
 
-// --- Scenario 5: carve disclosure (NEW, rev C) --------------------------------
+// --- Scenario 5: carve disclosure (rev C) --------------------------------------
 
 async function scenarioCarveDisclosure(): Promise<void> {
       console.log('\n=== F03 scenario: carve disclosure (over-ceiling fence — silence disqualifies) ===');
@@ -560,7 +571,7 @@ async function scenarioCarveDisclosure(): Promise<void> {
             `got ${countSubstring(raw2, 'chunk.carve')} after second heal`);
 }
 
-// --- Scenario 6: p1 membership (NEW, rev C) -----------------------------------
+// --- Scenario 6: p1 membership (rev C) ----------------------------------------
 
 async function scenarioP1Membership(): Promise<void> {
       console.log('\n=== F03 scenario: p1 membership (stale vh on a live path) ===');
@@ -626,74 +637,94 @@ async function scenarioP1Membership(): Promise<void> {
       await h2.ctx.log.dispose();
 }
 
-// --- Scenario 7: legacy cp:0 (NEW, rev C) -------------------------------------
+// --- Scenario 7: foreign cp:0 (rev D: synthetic seeds — stub severed) ----------
 
-async function scenarioLegacyCp0(): Promise<void> {
-      console.log('\n=== F03 scenario: legacy cp:0 (stub-era records are foreign, not verifiable) ===');
+async function scenarioForeignCp0(): Promise<void> {
+      console.log('\n=== F03 scenario: foreign cp:0 (synthetic un-derivable seeds — stub severed) ===');
       const fs = new FakeFileSystem();
       const SHARD = shardPath(ROOT, ORIGIN);
       const SPEC: NoteSpec = { path: 'Notes/f03-legacy.md', bytes: paraFiller(6, 'legacy') };
       fs.write(`${ROOT}/${SPEC.path}`, SPEC.bytes);
 
-      const STUB_COUNT = chunkStub(SPEC.bytes).length;
       const REAL_COUNT = realChunkCount(SPEC.bytes);
-      check('legacy-cp0: world arithmetic — stub and chunkNote geometries differ',
-            STUB_COUNT !== REAL_COUNT,
-            `stub ${STUB_COUNT} vs real ${REAL_COUNT} — scenario is vacuous if equal`);
+      const truthVhs = chunkNote(SPEC.bytes).chunks.map((c) => c.vh);
 
-      // Spine construction: a healthy stub-era record set (cp:0, byte-perfect
-      // against the stub's own shape) plus the note's Tier-1 facts.
-      const ctx1 = spawnContext(ORIGIN, ROOT, {
-            fs, now: () => FIXED_TS, settings: { tier2IdleMs: GEOLOGICAL_IDLE_MS },
-      });
-      await appendFacts(ctx1, [SPEC]);
-      for (const c of chunkStub(SPEC.bytes)) {
-            await ctx1.log.appendEvent('plugin', 'chunk.indexed', {
-                  path: SPEC.path, ord: c.ord, bs: c.bs, be: c.be, vh: c.vh, cp: c.cp,
+      // Rev D seeds: cp:0 records with chunkNote-plausible offsets but
+      // UN-DERIVABLE sha16-shaped garbage vhs ('d' + zero-padded distinct
+      // hex, one per chunk). cp:0 is deliberate: by Dan's ruling no real
+      // pre-0.1.6 shard exists or ever will (private plugin), so 0 is the
+      // one foreign value that can NEVER masquerade as a legitimate
+      // future policy version. TEETH: if heal failed to skip these, P1
+      // membership would run on an un-derivable vh and fabricate a
+      // violation — the p1Failures === 0 assertion would go RED.
+      const foreignSeeds = chunkNote(SPEC.bytes).chunks.map((c, i) => ({
+            ord: c.ord,
+            bs: c.bs,
+            be: c.be,
+            vh: 'd' + (0xd000 + i).toString(16).padStart(15, '0'),
+                                                                       cp: 0,
+      }));
+      const SEED_COUNT = foreignSeeds.length;
+
+      check('foreign-cp0: world arithmetic — every seeded vh is distinct',
+            new Set(foreignSeeds.map((s) => s.vh)).size === SEED_COUNT,
+            `got ${new Set(foreignSeeds.map((s) => s.vh)).size}/${SEED_COUNT} distinct`);
+      check('foreign-cp0: world arithmetic — no seeded vh is derivable (teeth guard)',
+            foreignSeeds.every((s) => !truthVhs.includes(s.vh)),
+                  'a seeded vh collided with a real vh — scenario is vacuous');
+
+            // Spine construction: the foreign cp:0 record set plus the note's
+            // Tier-1 facts. Offsets plausible, vhs foreign by construction.
+            const ctx1 = spawnContext(ORIGIN, ROOT, {
+                  fs, now: () => FIXED_TS, settings: { tier2IdleMs: GEOLOGICAL_IDLE_MS },
             });
-      }
-      await ctx1.log.dispose();
+            await appendFacts(ctx1, [SPEC]);
+            for (const c of foreignSeeds) {
+                  await ctx1.log.appendEvent('plugin', 'chunk.indexed', {
+                        path: SPEC.path, ord: c.ord, bs: c.bs, be: c.be, vh: c.vh, cp: c.cp,
+                  });
+            }
+            await ctx1.log.dispose();
 
-      const h1 = await freshContext(fs);
-      const heal1 = await healScan(h1.ctx.log, h1.adapter, DIR);
-      check('legacy-cp0: heal did not refuse', !heal1.refused);
-      check('legacy-cp0: every cp:0 record LOUDLY skipped (foreign policy)',
-            heal1.p1Skipped === STUB_COUNT, `got ${heal1.p1Skipped} (expected ${STUB_COUNT})`);
-      check('legacy-cp0: zero FABRICATED failures against cp:0 records',
-            heal1.p1Failures === 0, `got ${heal1.p1Failures}`);
-      check('legacy-cp0: fresh cp:2 derivation emitted (novel vh set)',
-            heal1.chunksReemitted === REAL_COUNT, `got ${heal1.chunksReemitted} (expected ${REAL_COUNT})`);
-      await h1.ctx.log.dispose();
+            const h1 = await freshContext(fs);
+            const heal1 = await healScan(h1.ctx.log, h1.adapter, DIR);
+            check('foreign-cp0: heal did not refuse', !heal1.refused);
+            check('foreign-cp0: every cp:0 record LOUDLY skipped (foreign policy)',
+                  heal1.p1Skipped === SEED_COUNT, `got ${heal1.p1Skipped} (expected ${SEED_COUNT})`);
+            check('foreign-cp0: zero FABRICATED failures against cp:0 records',
+                  heal1.p1Failures === 0, `got ${heal1.p1Failures}`);
+            check('foreign-cp0: fresh cp:2 derivation emitted (novel vh set)',
+                  heal1.chunksReemitted === REAL_COUNT, `got ${heal1.chunksReemitted} (expected ${REAL_COUNT})`);
+            await h1.ctx.log.dispose();
 
-      // Errata: "every NEW record is cp:2" must EXCLUDE the pre-seeded
-      // cp:0 forensics — they belong on the spine, loudly skipped, until
-      // a retirement tool exists. Count the new set; forbid foreign cps.
-      const raw1 = fs.getBytes(SHARD)!;
-      const chunkEvents = parseEvents(raw1, 'chunk.indexed');
-      const cp2Records = chunkEvents.filter((e) => Number(e.cp) === 2).length;
-      const foreignRecords =
-      chunkEvents.filter((e) => Number(e.cp) !== 0 && Number(e.cp) !== 2).length;
-      check('legacy-cp0: skip disclosed, naming cp: 0 as the foreign policy',
-            countSubstring(raw1, 'unknown chunk policy') >= STUB_COUNT &&
-            countSubstring(raw1, 'cp: 0') >= 1);
-      check('legacy-cp0: exactly REAL_COUNT new cp:2 records on the spine',
-            cp2Records === REAL_COUNT, `got ${cp2Records} (expected ${REAL_COUNT})`);
-      check('legacy-cp0: no records with any cp outside {0, 2}',
-            foreignRecords === 0, `got ${foreignRecords}`);
+            // "Every NEW record is cp:2" must EXCLUDE the pre-seeded cp:0
+            // forensics — they belong on the spine, loudly skipped, forever.
+            // Count the new set; forbid foreign cps.
+            const raw1 = fs.getBytes(SHARD)!;
+            const chunkEvents = parseEvents(raw1, 'chunk.indexed');
+            const cp2Records = chunkEvents.filter((e) => Number(e.cp) === 2).length;
+            const foreignRecords =
+            chunkEvents.filter((e) => Number(e.cp) !== 0 && Number(e.cp) !== 2).length;
+            check('foreign-cp0: skip disclosed, naming cp: 0 as the foreign policy',
+                  countSubstring(raw1, 'unknown chunk policy') >= SEED_COUNT &&
+                  countSubstring(raw1, 'cp: 0') >= 1);
+            check('foreign-cp0: exactly REAL_COUNT new cp:2 records on the spine',
+                  cp2Records === REAL_COUNT, `got ${cp2Records} (expected ${REAL_COUNT})`);
+            check('foreign-cp0: no records with any cp outside {0, 2}',
+                  foreignRecords === 0, `got ${foreignRecords}`);
 
-      // Idempotence: the cp:2 set now collides; the cp:0 forensics stay
-      // skipped every heal — loudly, forever, until the migration tool
-      // that retires them exists (registered debt, named here).
-      const h2 = await freshContext(fs);
-      const heal2 = await healScan(h2.ctx.log, h2.adapter, DIR);
-      check('legacy-cp0: second heal re-emits NOTHING',
-            heal2.chunksReemitted === 0, `got ${heal2.chunksReemitted}`);
-      check('legacy-cp0: forensics still skipped loudly on second heal',
-            heal2.p1Skipped === STUB_COUNT, `got ${heal2.p1Skipped}`);
-      await h2.ctx.log.dispose();
+            // Idempotence: the cp:2 set now collides; the cp:0 forensics stay
+            // skipped every heal — loudly, forever (append-only truth).
+            const h2 = await freshContext(fs);
+            const heal2 = await healScan(h2.ctx.log, h2.adapter, DIR);
+            check('foreign-cp0: second heal re-emits NOTHING',
+                  heal2.chunksReemitted === 0, `got ${heal2.chunksReemitted}`);
+            check('foreign-cp0: forensics still skipped loudly on second heal',
+                  heal2.p1Skipped === SEED_COUNT, `got ${heal2.p1Skipped}`);
+            await h2.ctx.log.dispose();
 }
 
-// --- Scenario 8: twin-vh (NEW, rev C errata) -----------------------------------
+// --- Scenario 8: twin-vh (rev C errata) ----------------------------------------
 
 async function scenarioTwinVh(): Promise<void> {
       console.log('\n=== F03 scenario: twin-vh (identical chunks — within-pass dedup) ===');
@@ -755,13 +786,13 @@ async function main(): Promise<void> {
       await scenarioCorpseSuppress();
       await scenarioCarveDisclosure();
       await scenarioP1Membership();
-      await scenarioLegacyCp0();
+      await scenarioForeignCp0();
       await scenarioTwinVh();
       console.log('');
       if (failures === 0) {
             console.log('F03: ALL GREEN (canonical heal + idempotence + reversed-order vacuity guard '
             + '+ gap refusal + corpse suppression + carve disclosure + p1 membership '
-            + '+ legacy cp:0 skip + twin-vh within-pass dedup)');
+            + '+ foreign cp:0 skip + twin-vh within-pass dedup)');
       } else {
             console.log(`F03: ${failures} RED`);
       }

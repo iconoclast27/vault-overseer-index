@@ -67,12 +67,15 @@
 // F03 scenario corpse-suppress is the fixture earning this). A path the
 // spine says is dead heals to silence; its tombstone IS the record.
 //
-// Migration note 2026-10-26: the chunker dependency moved from the stub
-// (cp: 0, fixture-grade line packer) to chunkNote (cp: 2, production
-// paragraph/heading-chain/frontmatter chunker). contentSha now imports
-// from render.ts directly — the stub's last production consumer is
-// gone; only fixtures reference it. The stub is retired in deed, file
-// deletion pending fixture cleanup.
+// Migration note 2026-10-26, amended 2026-10-27: the chunker dependency
+// moved from the stub (cp: 0, fixture-grade line packer) to chunkNote
+// (cp: 2, production paragraph/heading-chain/frontmatter chunker).
+// contentSha imports from render.ts directly. The stub's last consumer
+// was F03's legacy-cp0 scenario; rev D (2026-10-27) reseeded it with
+// synthetic cp:0 records carrying un-derivable vhs — a foreign-policy
+// probe that owes nothing to stub geometry — after which the stub was
+// deleted (Phase 4). No code references remain; surviving mentions are
+// prose history in fixture ledgers.
 //
 // Errata note 2026-10-26 (post first contact): within-pass dedup added.
 // The emission loop now records each emitted vh into haveVh, so a
