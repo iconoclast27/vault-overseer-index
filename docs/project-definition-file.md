@@ -90,7 +90,7 @@ Core jobs:
 2. Chunker + FTS5 fuzzy search (with fixture corpus and property tests from day one)
 3. Embeddings + related notes sidebar (two-tab sidebar: Search / Related)
 4. Plugin 2 scaffold + single-note jobs: description, frontmatter per template, tagging per Taxonomy note
-5. Maintenance job runner: batch jobs with diff-review approval; catch-up behavior on desktop convergence ("ensure notes in {folder} have frontmatter like {template}", "tag per taxonomy", "set parent")
+5. Maintenance job runner: batch jobs with diff-review approval; catch-up behavior on desktop convergence ("ensure notes in {folder} have frontmatter like {template}", "tag per taxonomy", "set pa<!--  --><!--  -->rent")
 6. Background vault-health scan → report
 7. RAG chat and knowledge capture
 

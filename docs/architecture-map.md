@@ -68,7 +68,10 @@ flowchart LR
     CH --> TI2["Tier-2 buffered<br/>chunk.* / link.*"]
 ```
 
-> [!note] Revision 2026-10-24 — implementation status (the diagram is design; this is ground truth) **Shipped:** the spine beneath the diagram — `EventLog`, writer, merge-scan, checkpoints, heal scan, dwell gate, rename wiring. **Not yet built:** the debouncer, planner, embedder, and vector store — the pipeline proper has no producer yet; the plugin registers exactly two vault/workspace events (`file-open`, `rename`) and no watcher. The chunker exists as a hostile-tested library (`chunkNote`, cp: 2, C-suite + property tests green) that nothing calls. The map's pipeline remains the destination, unchanged.
+> ****
+
+> [!note] Revision 2026-10-27 — implementation status **Shipped:** the spine (EventLog, writer, merge-scan, checkpoints, heal scan, dwell gate, rename wiring) + **File watcher lane** (`src/watcher/watch.ts`, F12-certified, 13 scenarios, 64 checks green) — Tier-1 facts created/deleted via `onVaultCreate`/`onVaultDelete` and automatic reconcile at writer attach. **Heal migrated to `chunkNote` geometry** (2026-10-26), **stub deleted** (2026-10-27, Phase 4). **Still pending:** planner / `note.modified` lane (R6 no-op dedup, F08 blocked), subscriber seam (tail-not-poll commitment), `folder.renamed` event (pending consumer), embeddings + vector store (Phase 3). **The chunker is alive in production** — heal re-derives on every boot (de facto steady-state producer until planner lands); idempotent dedup verified across three reloads (fresh shard: 4,812 lines, zero duplicates).
+
 
 **Key invariants (v0.3):**
 
@@ -179,16 +182,15 @@ The schema family carries its own proof obligations: Event Log Fixture Corpus v0
 
 ## Next Step
 
-**Rewritten 2026-10-24** (the v0.3 original described Phase 1 scaffold; Phase 1 has shipped through 0.1.4 with 0.1.5 rename wiring bound). The actual frontier, in order:
+**Rewritten 2026-10-27 (post-0.1.7)**. **Completed 0.1.6→0.1.7:** heal migration + stub deletion (Phase 4), foreign-cp probe + within-pass dedup (F03 rev D), spec fold (Phase 5). The actual frontier, in order:
 
-1. **0.1.5 release** — rename wiring, live receipt in the test vault (rename a note; `note.renamed` lands in causal order in the shard tail)
-2. **File watcher + planner** — the pipeline's missing producers: `note.created`/`modified`/`deleted` facts from vault events through the debouncer; this is where `chunkNote` finally gets called by the shipping plugin
-3. **Subscriber seam** — the `onAppend` lane on the writer's serialized queue; the index's tail-not-poll commitment made real
-4. **folder.renamed** — transcribe the event the moment its consumer (the seam) exists; extend F05a's R6 family
-5. **Heal stub→chunker migration** — production heal re-derives at cp: 2, retiring the stub (F03's registered debt)
-6. **F05b** — the embed-in-flight race, once the embedder and batch queue exist
+1. **Planner / `note.modified` lane** — the pipeline's missing producer; unblocks F08 (no-op dedup), F06 (conflict copies), F05b (embed race), and retires heal's de facto steady-state role
+2. **Subscriber seam** — the `onAppend` lane on the writer's serialized queue; makes the projection live; also unblocks `folder.renamed` transcription
+3. **FTS5 projection + search UI** — the first user-visible capability (Ollama-down survival; constraint 4)
+4. **F04 slow-suite** — cross-origin convergence; fully specified, runnable against spawnContexts today
+5. **Embeddings + vector store + related notes** — Layer 2 lane; prerequisite for strategy-doc skills
 
-Done for the next milestone means: the watcher records file facts, the chunker has a live caller, and the spine carries its first real chunk event — the indexer stops being a log-writer with ambition.
+
 
 ## Relations
 

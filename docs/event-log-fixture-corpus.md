@@ -98,7 +98,8 @@ A tiny `FakeAdapter implements DataAdapter` (`read`, `write`, `append`, `mkdir`,
 
 **Fail smells:** re-derivation emitting duplicates; heal scan silent; any Tier-1 loss; re-derived offsets failing to reproduce their text.
 
-**Status (2026-10-24):** first-contact receipt banked — beacons land clean, heal silent on a fact-light shard, as designed. One declared migration debt: **heal currently re-derives via `chunker/stub.ts` (cp: 0), not `chunkNote` (cp: 2).** The fixture world is self-consistent on the stub; production heal must migrate to the real chunker before mixed-`cp` shards exist (schema rule: mixed `cp` in a projection ⇒ re-chunk required — a healed-at-cp0 note re-healed at cp2 forces the re-chunk it was meant to avoid). Migration is a work item, not a defect.
+**Status (2026-10-27):** migration debt closed 2026-10-26 (F03 rev C rev D rev D reseed), stub deleted 2026-10-27 (Phase 4). Heal now re-derives via `chunkNote` (cp: 2) on all live paths; foreign cp (≠2) loudly skipped with disclosure; within-pass vh dedup verified (scenario twin-vh, 2026-10-26 errata). Fresh-shard recertification (Phase 3) verified cp:2 uniformity, idempotent boot-2 growth noise-level. No mixed-cp shards exist or will exist.
+
 
 ---
 

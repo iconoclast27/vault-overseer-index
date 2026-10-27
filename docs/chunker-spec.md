@@ -1,23 +1,12 @@
----
-source:
-status: pending
-para:
-context:
-description:
-Topics:
-Concepts:
-Meeting notes:
-Permanent: false
-type: note
-word_count: 1
-language: en
-updated:
-modified: 2026-10-24T18:07:56+01:00
----
----
-# Vault Overseer — Chunker Spec v0.1 (rev. 2026-10-24)
+***
 
-> [!abstract] Purpose Defines R11: the paragraph-level, heading-chained, frontmatter-stamped chunker, its output contract against the event log, and the property tests + hostile fixtures that prove it. Produces the `bs`/`be`/`vh`/`cp` world the log records. Companion to Event Log Schema v0.2 (rev. 2026-10-24), Project Definition File, and the Log Fixture Corpus v0.1 (rev. 2026-10-24).
+## source: status: pending para: context: description: Topics: Concepts: Meeting notes: Permanent: false type: note word\_count: 1 language: en updated: modified: 2026-10-24T18:07:56+01:00
+
+***
+
+# Vault Overseer — Chunker Spec v0.1 (rev. 2026-10-27)
+
+> \[!abstract] Purpose Defines R11: the paragraph-level, heading-chained, frontmatter-stamped chunker, its output contract against the event log, and the property tests + hostile fixtures that prove it. Produces the `bs`/`be`/`vh`/`cp` world the log records. Companion to Event Log Schema v0.2 (rev. 2026-10-24), Project Definition File, and the Log Fixture Corpus v0.1 (rev. 2026-10-24).
 
 ## Design principles
 
@@ -41,30 +30,29 @@ Line endings: the chunker normalizes **nothing**. `bs`/`be` are offsets into the
 
 **Step 3 — Heading chain attach.** Track `H1→…→H-current` while walking. Each paragraph carries its chain. Chains reset on frontmatter boundary only (document-level), not per-section.
 
-**Step 4 — Budget fitting.** Target ~512 tokens, hard ceiling ~768 (approximation: 4 bytes/token heuristic for Latin, refined for CJK at 2 bytes/token — Latin-1... no; honestly, at v1 we use a byte budget of 2048/3072 respectively as proxy, which for `nomic-embed-text`'s 8192 context is comfortably conservative; token-exact fitting is a `cp` bump later if measurement says so). Behaviors:
+**Step 4 — Budget fitting.** Target \~512 tokens, hard ceiling \~768 (approximation: 4 bytes/token heuristic for Latin, refined for CJK at 2 bytes/token — Latin-1... no; honestly, at v1 we use a byte budget of 2048/3072 respectively as proxy, which for `nomic-embed-text`'s 8192 context is comfortably conservative; token-exact fitting is a `cp` bump later if measurement says so). Behaviors:
 
-- Small adjacent paragraphs under target **merge** into one chunk (up to target)
-- A single paragraph over the hard ceiling splits at sentence boundaries; a sentence over the ceiling splits at word boundaries; a word over the ceiling... fixture tells us what honest behavior is (truncate-with-log vs. carve-with-remainder — parked decision below)
-- Chunks do **not** span heading boundaries: a new `##` closes the current chunk even under target. Heading chains would blur otherwise.
+* Small adjacent paragraphs under target **merge** into one chunk (up to target)
+* A single paragraph over the hard ceiling splits at sentence boundaries; a sentence over the ceiling splits at word boundaries; a word over the ceiling... **carve-anyway, never truncate, always disclose** (parked decision #1 ratified below)
+* Chunks do **not** span heading boundaries: a new `##` closes the current chunk even under target. Heading chains would blur otherwise.
 
 **Step 5 — Offset capture.** Each chunk records `bs`/`be` — first byte of its first paragraph to last byte of its last, **inclusive-exclusive** (`[bs, be)`, the convention every sane byte-range API uses; stated here because it's the kind of unstated assumption that kills off-by-one for a decade).
 
 **Step 6 — vh computation.** `vh = sha256(prefix || chain || fm_context || chunk_text)` — the _exact_ string built for the embedder, in the exact serialization the embed path uses. This means the chunker and embedder share one `renderEmbedInput(chunk)` function; two implementations would be two drift opportunities (VC's lesson generalized).
 
-**Prefix:** `search_document:` per R3 and the Project Definition's locked prefix decision. Query-side gets `search_query:` — same render function, different flag. Title/context prefixing (VC's counter-design) is _additive_: chain and fm_context already carry the context; the R3 argument is thereby satisfied as both, at one mechanism.
+**Prefix:** `search_document:` per R3 and the Project Definition's locked prefix decision. Query-side gets `search_query:` — same render function, different flag. Title/context prefixing (VC's counter-design) is _additive_: chain and fm\_context already carry the context; the R3 argument is thereby satisfied as both, at one mechanism.
 
 ## Output contract (into the log)
 
 Per chunk: `{ path, ord, bs, be, vh, cp }` — metadata only, per the ratified ruling. The chunker owns `cp`; the log never interprets it. `cp` bumps on any behavioral change to Steps 1–6, including approximation-constant changes.
 
-> [!note] Revision 2026-10-24 — implementation status (undocumented until now)
-> **Deployed production chunker: `chunkNote` at cp: 2** — file `src/chunker/chunker.ts`; C-suite (C01–C06) and property harness (P1–P6, 2000-doc seeded corpus) both green in the 2026-10-24 baseline. **A second chunker-shaped implementation exists: `src/chunker/stub.ts` at cp: 0** — a deliberately dumb deterministic splitter ("dead code walking," by its own header) used by the F03 fixture world for chunk arithmetic and by the current heal scan for re-derivation. It is not a placeholder for the production chunker; it is a fixture-grade oracle. **Registered debt** (Corpus F03, 2026-10-24): production heal must migrate from the stub to `chunkNote` before mixed-`cp` shards exist. The stub retires with that migration. A spec reader should know there are two implementations and which one is truth.
+> \[!note] Revision 2026-10-27 — implementation status **Deployed production chunker: `chunkNote` at cp: 2** — file `src/chunker/chunker.ts`; C-suite (C01–C06) and property harness (P1–P6, 2000-doc seeded corpus) green in the 2026-10-27 fleet run (Phase 4). **Heal migrated from stub to `chunkNote` geometry** — migration completed 2026-10-26, stub deleted 2026-10-27 (Phase 4). Heal's P1 is fresh-derivation **membership**: every recorded vh on a live path must appear among the vhs derived from present-day bytes. **Foreign cp (anything ≠ 2) is loudly skipped with disclosure** — never verified, never fabricated as violations — including cp: 0 (stub-era records, extinct as a production possibility in a private-plugin universe) and any future cp version. Within-pass vh dedup: identical chunks emit exactly once per derivation. **Fresh-shard recertification (Phase 3, 2026-10-27)**: regenerated spine uniformly cp: 2, reconcile silent across reloads, idempotent boot growth noise-level. Prior mixed-cp compatibility scan on a legacy cp: 0 shard was a one-time migration event (declared, not a defect class going forward — no pre-0.1.6 shards exist or will exist).
 
 ## Properties (fast, every commit)
 
 **P1 — Offsets reproduce text.** ∀ chunks: `renderChunk(note_bytes, bs, be) === chunk_text` for a generated corpus of thousands of randomized documents (seeded generator: random headings, paragraphs, tables, code fences, CJK runs, emoji, 0-byte files, BOM cases, lone-newline tails, degenerate frontmatter).
 
-**P2 — Partition.** Chunks are ordered, non-overlapping, and jointly cover the entire body (offsets sorted; `be[i] == bs[i+1] _within_ a chunk's internal paragraph merges; gaps only where the assembler legitimately declines whitespace runs). Stated crisply: every body byte is claimed by exactly one chunk or by no-chunk-under-a-declared-rule, and the rule list is enumerated in the implementation docs.
+**P2 — Partition.** Chunks are ordered, non-overlapping, and jointly cover the entire body (offsets sorted; \`be\[i] == bs\[i+1] _within_ a chunk's internal paragraph merges; gaps only where the assembler legitimately declines whitespace runs). Stated crisply: every body byte is claimed by exactly one chunk or by no-chunk-under-a-declared-rule, and the rule list is enumerated in the implementation docs.
 
 **P3 — Determinism.** Same bytes + same `cp` ⇒ identical chunk list, bit-for-bit, run-to-run and machine-to-machine (this test runs twice with different env seeds; also the property F04 silently relies on).
 
@@ -84,22 +72,18 @@ Per chunk: `{ path, ord, bs, be, vh, cp }` — metadata only, per the ratified r
 
 **C04 — Heading with no content.** Seven consecutive headings, no paragraphs between. Zero-length chunks must never be emitted; ord sequence stays dense.
 
-**C05 — Frontmatter degeneracies.** Missing colons, duplicate keys, tabs, `---` inside a YAML value, empty frontmatter (`---\n---`). Parsing degrades to "no fm_context," never throws.
+**C05 — Frontmatter degeneracies.** Missing colons, duplicate keys, tabs, `---` inside a YAML value, empty frontmatter (`---\n---`). Parsing degrades to "no fm\_context," never throws.
 
 **C06 — Renamed-not-modified.** Same bytes at a new path: identical `vh`s (already F05's premise — this is the cheap fast-loop canary for it).
 
-> [!note] Revision 2026-10-24 — C06 cross-reference
-> F05's premise is now certified fact: F05a shipped 2026-10-24 (rename wiring, gate semantics — 26 checks green), and the spine carries `note.renamed` at Tier 1. C06 remains the fast-loop canary for `vh` path-independence. C05 additionally pins the five ratified fm degeneracy variants (superseding the spec's blanket criterion, per the csuite receipt).
+> \[!note] Revision 2026-10-24 — C06 cross-reference F05's premise is now certified fact: F05a shipped 2026-10-24 (rename wiring, gate semantics — 26 checks green), and the spine carries `note.renamed` at Tier 1. C06 remains the fast-loop canary for `vh` path-independence. C05 additionally pins the five ratified fm degeneracy variants (superseding the spec's blanket criterion, per the csuite receipt).
 
 ## Parked decisions
 
-1. **Over-ceiling single word** — truncate-with-`log.integrity` vs. carve-anyway. My lean: carve-anyway (never lose text), but it's a real judgment call about embedding quality.
-   > [!note] Revision 2026-10-24 — likely settled de facto, confirm before folding
-   > The spec's own invariants constrain the answer: C01's pass criteria demand every emitted chunk ≤ ceiling, and P1/P2 jointly demand that all body bytes are claimed or declined under an enumerated rule. Truncate-with-loss satisfies both only if the loss is a *declared* no-chunk rule; otherwise the only legal behavior is carve-anyway. The property corpus (2000 docs, seeded, green) plausibly generates over-ceiling words, which would make carve-anyway the tested truth already. **Confirm before folding into the spec body:** check what `chunkNote` actually does with an over-ceiling single word — one code check (`rg -n "carve|ceiling" src/chunker/chunker.ts` and read the terminal-split branch) settles it. Fold the ruling at that touch; don't re-litigate at the next `cp` bump.
-
+1. **Over-ceiling single word — RATIFIED: carve-anyway, never truncate, always disclose.** Folded 2026-10-27 (Phase 5). A word or atomic paragraph over the hard ceiling is carved at UTF-8-safe byte offsets into pieces, every piece under the ceiling, and every carve is disclosed as a `log.integrity` `chunk.carve` event (`reason=over-ceiling-byte-carved`, `paragraph_end`, `pieces=N`). No text is ever dropped or truncated: the killer invariant (P1/P2 partition) permits carve-anyway only — a "declined" rule would have to be enumerated and declared, and losing embeddable text by choice serves nobody. Ratified in code at `chunker.ts` lines 59–61 plus the `splitRange` ladder (carve disclosure tied to novel emission in heal). Production receipt: 28 carves on the legacy-shard scan of 2026-10-27, reason-stamped, pieces-counted, zero defects.
 2. **Token-exact budgeting** — v1 uses byte proxy per above; measure first, bump `cp` later.
 3. **List-item clustering** — markdown lists as one paragraph (current: yes, blank-line-separated). Obsidian callouts (`> [!note]` blocks) treated as atomic — defaulted to atomic; revisit if fixtures show pathological lengths.
 
----
+***
 
-_Footer: v0.1, 2026-10-20; revised 2026-10-24. The revision adds implementation-status documentation only — the production chunker's deployed `cp` and the stub's existence and role, the C05 ratification note, C06's F05a cross-reference, and the near-settlement of parked decision #1 pending one code check. No design principle, contract, property, or fixture requirement was altered. Companion references updated to the 2026-10-24 revisions of the Schema and Fixture Corpus._
+_Footer: v0.1, 2026-10-20; revised 2026-10-24 (implementation-status documentation, C05/C06 notes); revised 2026-10-27 (parked decision #1 ratified and folded; implementation-status rewritten for the post-migration, post-stub-deletion reality). No design principle, contract, property, or fixture requirement was altered. Companion references remain the 2026-10-24 revisions of the Schema and Fixture Corpus._
