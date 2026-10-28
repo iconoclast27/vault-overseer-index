@@ -197,9 +197,23 @@ Shard whose last line's origin mismatches local id ⇒ loud startup rejection, n
 
 ---
 
-## F08 — No-op modification dedup (parked)
+## F08 — No-op modification dedup (SHIPPED, CERTIFIED 2026-10-28)
 
-Same sha + mtime ⇒ zero events, zero seq consumed. Must prove the seq counter _doesn't_ advance — off-by-one here poisons everything downstream. Blocked on the file watcher (no `note.modified` producer yet).
+Same sha + mtime ⇒ zero events, zero seq consumed. Must prove the seq counter _doesn't_ advance — off-by-one here poisons everything downstream. Fixture authored from contract text (not code behavior) after the planner's design contract was ratified: state basis (spine read at flush), mtime rule (either field differing ⇒ emit), cancel-on-delete/rename, gap-refusal, and coalescing rules were all ruled before F08 was written.
+
+Fixture idiom: direct-drive the planner lane (F05a/F09 pure-module style). Spy harness records appendEvent calls; zero calls proves zero seq consumed. Shard bytes compared before/after no-op flush as the disk-side witness.
+
+**First-contact reds earned** — not contrived:
+  - `mergeScan` required `listDir` on ByteSource (declaration #1 disproven by receipt; fixed by pasting reader.ts)
+  - S10 leaked S9's gap spine (spine-bleed drafting defect; fixed by rewriting clean spine at S10 start)
+
+**Status (2026-10-28): SHIPPED, CERTIFIED.** `f08.ts`: 25 checks across 11 scenarios, ALL GREEN. Verified against contract text, not observed behavior. Sequencing-ruling precedent for future-new-subsystems: design contract → rulings → implementation → fixture-from-contract-text.
+
+**Deferred (not silently dropped):** real-writer continuity probe (appending through live EventLog, shard-tail seq+1 verification) pending test-harness contract paste; overflow disclosure; stat/sha mid-coalescing disagreement.
+
+**Fail smells:** any seq advancement on no-op; silence on unwired routing hooks; retain pending across gap refusal; silent drop of pre-arm observations.
+
+
 
 ---
 

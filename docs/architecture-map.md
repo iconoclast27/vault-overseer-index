@@ -180,16 +180,18 @@ The machine-switch story _is_ the shard diagram: new machine gets the synced sha
 
 The schema family carries its own proof obligations: Event Log Fixture Corpus v0.1 rev. 2026-10-24 (F01–F03, F05a, F06, F11, F11-deepening live; F07–F10 parked with stated blockers; F05b deferred on the embedder) for the spine plus the dwell gate, Chunker Spec P1–P6 property tests for chunking, hostile-fixture corpus in the test vault at `~/Documents/Test Vault/_fixtures/`. Definition of done includes at least one initially-red fixture against the first implementation — a corpus that passes on first contact hasn't been hostile enough (hostility ledger in the corpus doc, rev. 2026-10-24: F05a drew two legitimate first-contact reds; F09's family drew four drafting defects before its fixture ever ran). Two-level logging (terse info + reconstructive trace) throughout.
 
+
+---
 ## Next Step
 
-**Rewritten 2026-10-27 (post-0.1.7)**. **Completed 0.1.6→0.1.7:** heal migration + stub deletion (Phase 4), foreign-cp probe + within-pass dedup (F03 rev D), spec fold (Phase 5). The actual frontier, in order:
+Rewritten post-0.1.7, 2026-10-28. **Completed 0.1.7 → 0.2.0-start:** planner / `note.modified` lane shipped and fixture-certified (F08). The actual frontier, in order:
 
-1. **Planner / `note.modified` lane** — the pipeline's missing producer; unblocks F08 (no-op dedup), F06 (conflict copies), F05b (embed race), and retires heal's de facto steady-state role
-2. **Subscriber seam** — the `onAppend` lane on the writer's serialized queue; makes the projection live; also unblocks `folder.renamed` transcription
-3. **FTS5 projection + search UI** — the first user-visible capability (Ollama-down survival; constraint 4)
-4. **F04 slow-suite** — cross-origin convergence; fully specified, runnable against spawnContexts today
+1. **Subscriber seam** — the `onAppend` lane on the writer's serialized queue; makes the projection live; also unblocks `folder.renamed` transcription
+2. **FTS5 projection + search UI** — the first user-visible capability (Ollama-down survival; constraint 4)
+3. **F04 slow-suite** — cross-origin convergence; fully specified, runnable against spawnContexts today
+4. **Planner wiring into main.ts** — connect the watcher's `onVaultModify` to the planner's `onVaultModify`, arm at writer attach; adapter territory, proof by live receipt
 5. **Embeddings + vector store + related notes** — Layer 2 lane; prerequisite for strategy-doc skills
-
+---
 
 
 ## Relations
