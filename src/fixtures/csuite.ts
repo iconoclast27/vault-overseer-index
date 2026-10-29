@@ -65,6 +65,10 @@
 //   (d) ZERO-CHUNK SILENCE: contentless note crosses the bridge
 //       emitting nothing — silence is correct, not a log gap.
 //
+// TYPE DEBT NOTE (2026-10-29): `detail` on Recorded is mutable by
+//   design — both the appendEvent and reportIntegrity paths set it.
+//   The former `readonly` was an ornament the compiler rejected.
+//
 // Run:  node ./src/fixtures/csuite.ts
 // Node note: erasable TS, .ts import extensions.
 // =============================================================================
@@ -132,7 +136,7 @@ function quietChunk(label: string, doc: Uint8Array):
 interface Recorded {
       readonly type: string;
       readonly payload: Record<string, unknown>;
-      readonly detail?: string; // log.integrity only
+      detail?: string; // log.integrity only — mutable: set on both append paths
 }
 
 /**

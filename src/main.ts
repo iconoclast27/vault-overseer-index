@@ -7,6 +7,61 @@
 // F03 heal scan, and expose the Plugin 2 seam. Everything here is wiring;
 // the spine's semantics live in src/eventlog/*.
 //
+// 0.1.7-bound — PLANNER WIRING (frontier slot 4, 2026-10-29):
+//
+//   The note.modified producer (src/planner/planner.ts, rev A, F08-
+//   certified 2026-10-28) becomes a real pipeline producer. Adapter
+//   obligations per the planner's own header: map TAbstractFile ->
+//   onVaultModify, call cancelPending from the delete and rename
+//   handlers, arm() at writer attach, supply the scheduler.
+//
+//   - LISTENER: vault.on('modify') registers at layout-ready alongside
+//     create/delete (Option-A consistency). PARTIAL RECEIPT (2026-10-29,
+//     via typecheck): the callback parameter is TAbstractFile per
+//     obsidian.d.ts typings — first draft wrongly assumed TFile and the
+//     compiler caught it (TS2739 at the registration site). Handler now
+//     guards with instanceof TFile, same pattern as create/delete. LINE
+//     CITATION still owed — verify the obsidian.d.ts line number before
+//     merge; the shape is typecheck-verified, the citation is not.
+//   - ROUTING (ruled 2026-10-29): routeCreate AND routeRestore both
+//     forward through the watcher lane's create path, GUARDED. Dead-on-
+//     spine + alive-on-disk re-creating is exactly reconcile's S13
+//     semantics; spine-unknown paths likewise converge on creation. A
+//     vanished path throws inside stat — caught, disclosed via
+//     reportIntegrity, never propagated: a routing throw must not kill
+//     the flush loop.
+//   - SCHEDULER (ruled in): window.setTimeout/clearTimeout — automatic
+//     30s coalescing windows. Without it the lane is manual-flush-only.
+//   - ARM ORDER (ruled): after watcherLane.flushAfterAttach() in
+//     startWriter, so the planner's first flush reads a spine that
+//     already contains the drained dark facts — routing decisions are
+//     made against complete truth.
+//   - STAT/SHA: extracted from the watcher's inline closures to private
+//     helpers, shared with the planner lane (flagged refactor, 2026-10-
+//     29 — behavior-identical, same error messages, one implementation
+//     of the 16-hex sha convention instead of two).
+//
+//   DECLARED LIMITATIONS (loud, not hidden):
+//   - Boot-window modifies (onload -> layout-ready) are missed —
+//     heal-covered, same regime as Option A's create window.
+//   - NO farewell flush at unload: onunload is synchronous and the
+//     planner's flush is async behind a mergeScan — its appends would
+//     race dispose()'s queue join and drop on this.log = null.
+//     Unload-window loss extends the planner's declared crash-window
+//     limitation; boot-heal is the recovery path.
+//   - FOLDER-RENAME STALE-PENDING GAP (registered, unmitigated in v1):
+//     a pending modify under a renamed folder SURVIVES the rename —
+//     folder renames emit no spine event (folder.renamed still pending
+//     transcription) and the planner exposes no prefix cancel — so the
+//     flush emits note.modified against the STALE address. Bounded:
+//     the projection already considered the path live, heal covers the
+//     divergence. Systemic fix: folder.renamed + planner rev B
+//     cancelPrefix (mirroring gate.renamePrefix) — a ruled design
+//     change, not adapter territory.
+//   - asModifiedPayload joins the registered bridge-debt family
+//     (f12.ts, watcher closure, this one) — typing watch.ts's payload
+//     surface at source retires all three.
+//
 // 0.1.6-bound — RECONCILE GATE (B3, 2026-10-25):
 //
 //   Two doors, one routine:
@@ -152,7 +207,7 @@
 //   - REMAINING DECLARED WART (superseded by F05a, 2026-10-24, kept
 //     for the record): placeholder-path emissions were uncorrectable
 //     until note.renamed was wired. Now correctable — see the
-//     0.1.5-bound block above.
+//     0.1.-bound block above.
 //
 //   Farewell ordering doctrine, unchanged: onunload() is SYNCHRONOUS
 //   and enqueues farewell dwell events into the serialized write
@@ -245,6 +300,10 @@
 //   — obsidian.d.ts l.10451. Verified 2026-10-24. TFolder instanceof
 //   disambiguates; folder renames arrive on the same event (no
 //   separate folder-rename hook exists).
+//   on('modify', (file: TAbstractFile) => any, ctx?) — SHAPE
+//   VERIFIED via typecheck 2026-10-29 (callback param is
+//   TAbstractFile per obsidian.d.ts typings; first draft wrongly
+//   assumed TFile — TS2739 caught it). LINE CITATION still owed.
 //   onLayoutReady(callback: () => any): void — obsidian.d.ts l.10740,
 //   with the create-at-load guidance at l.10429. Verified 2026-10-25.
 //   getMarkdownFiles(): TFile[] — obsidian.d.ts l.10418. Verified
@@ -264,6 +323,22 @@
 //
 // Consequence: data.json carries shared knobs only. Per-device state
 // lives in sync-excluded lanes (origin.txt) or it isn't safe.
+//
+// TYPECHECK FIX (2026-10-29, three contained fixes):
+//   1. `settings` redeclared over Plugin's base property (TS2612):
+//      definite-assignment assertion (`!`) still emits a field define
+//      that would overwrite the base — replaced with `declare`, which
+//      emits nothing and lets loadSettings remain the sole assigner.
+//   2. `this.app.setting` (TS2339): Obsidian's public App typings lack
+//      the internal settings-tab surface this certification path uses
+//      to force a redraw. Contained structural cast at the one call
+//      site; named, not hidden.
+//   3. Watcher appendEvent payload bridge (TS2345): the watcher lane's
+//      dep surface carries shape-loose payloads while the typed log API
+//      demands the discriminated union — same bridge as f12.ts's
+//      asTypedPayload (Option B, 2026-10-29). REGISTERED DEBT, shared
+//      with the fixture: typing watch.ts's payloads at source retires
+//      both bridges. Keep the two copies in sync until then.
 // =============================================================================
 
 import {
@@ -285,6 +360,13 @@ import { healScan } from './eventlog/heal.ts';
 import { projectPaths } from './eventlog/projection.ts';
 import { DwellGate } from './dwell/gate.ts';
 import { makeWatcherLane } from './watcher/watch.ts';
+import { makePlanner } from './planner/planner.ts';
+import type { PlannerLane } from './planner/planner.ts';
+import type {
+    NoteCreatedPayload,
+    NoteDeletedPayload,
+    VaultOverseerEvent,
+} from './eventlog/types.ts';
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -317,6 +399,31 @@ export interface VaultOverseerSettings {
 }
 
 const DEFAULT_SETTINGS: VaultOverseerSettings = {};
+
+/**
+ * Typed bridge from the watcher lane's shape-loose payload to the typed
+ * log API (typecheck fix, 2026-10-29 — same registered debt as f12.ts's
+ * asTypedPayload; retire both by typing watch.ts at source). The lane's
+ * own producer code constructs these payloads; this cast is contained at
+ * the adapter boundary, not sprinkled.
+ */
+function asTypedPayload(p: unknown): NoteCreatedPayload | NoteDeletedPayload {
+    return p as NoteCreatedPayload | NoteDeletedPayload;
+}
+
+/**
+ * Typed bridge for the planner lane's shape-loose payload (slot 4 wiring,
+ * 2026-10-29) — third member of the registered bridge-debt family
+ * (f12.ts, the watcher closure above, this one). Built on Extract rather
+ * than a named payload type: whether types.ts exports a NoteModifiedPayload
+ * alias is unverified this session — swap for the named import if it
+ * exists. Retire all three by typing the producing modules at source.
+ */
+function asModifiedPayload(
+    p: unknown,
+): Extract<VaultOverseerEvent, { type: 'note.modified' }>['payload'] {
+    return p as Extract<VaultOverseerEvent, { type: 'note.modified' }>['payload'];
+}
 
 // -----------------------------------------------------------------------------
 // Adapter — Obsidian's DataAdapter behind the log's structural interface
@@ -460,8 +567,8 @@ async function resolveOrigin(
 
 /**
  * Rung 2 completion: persist the certified/chosen id to origin.txt,
- * creating the sync-excluded identity lane. Called only from the
- * certification surface (Rung 2) — the only path that creates
+ * creating the sync-excluded identity lane. Called only from
+ * the certification surface (Rung 2) — the only path that creates
  * origin.txt, since Rung 3 was deleted in 0.1.2.
  */
 async function writeOriginFile(
@@ -478,7 +585,12 @@ async function writeOriginFile(
 // -----------------------------------------------------------------------------
 
 export default class VaultOverseerIndex extends Plugin {
-    settings!: VaultOverseerSettings;
+    /**
+     * `declare` (typecheck fix 2026-10-29): the former `!` assertion
+     * still emitted a field define overwriting Plugin's base property.
+     * Declare emits nothing; loadSettings is the sole assigner.
+     */
+    declare settings: VaultOverseerSettings;
 
     log: EventLog | null = null;
 
@@ -535,43 +647,41 @@ export default class VaultOverseerIndex extends Plugin {
      * so the lane exists before onload but cannot emit into a dark
      * writer. Dark-buffer cap defaults to 500 per session ruling
      * 2026-10-25.
+     *
+     * Slot-4 refactor (2026-10-29): stat/sha extracted to private
+     * helpers, shared with the planner lane — behavior-identical,
+     * same error messages.
      */
     private readonly watcherLane = makeWatcherLane(
         {
-            stat: async (path: string) => {
-                const stat = await this.app.vault.adapter.stat(path);
-                if (stat === null || stat.type !== 'file') {
-                    throw new Error(`Watcher stat: file absent (${path})`);
-                }
-                return { mtime: stat.mtime, bytes: stat.size };
-            },
-            contentSha: async (path: string) => {
-                const bytes = await this.app.vault.adapter.readBinary(path);
-                if (bytes === undefined) {
-                    throw new Error(`Watcher sha: file absent (${path})`);
-                }
-                const hash = await crypto.subtle.digest(
-                    'SHA-256',
-                    new Uint8Array(bytes),
-                );
-                return Array.from(new Uint8Array(hash))
-                .map((b) => b.toString(16).padStart(2, '0'))
-                .join('')
-                .slice(0, 16);
-            },
-            appendEvent: async (actor, type, payload) => {
-                if (this.log === null) return; // writer dark: drop
-                await this.log.appendEvent(actor, type, payload);
-            },
-            reportIntegrity: async (detail) => {
-                if (this.log === null) return;
-                await this.log.reportIntegrity(detail);
-            },
+            stat: (path: string) => this.statSnapshot(path),
+                                                   contentSha: (path: string) => this.contentShaOf(path),
+                                                   appendEvent: async (actor, type, payload) => {
+                                                       if (this.log === null) return; // writer dark: drop
+                                                       await this.log.appendEvent(actor, type, asTypedPayload(payload));
+                                                   },
+                                                   reportIntegrity: async (detail) => {
+                                                       if (this.log === null) return;
+                                                       await this.log.reportIntegrity(detail);
+                                                   },
         },
         { darkBufferCap: 500 },
     );
 
-    /** Sequential counter backing the TFile→noteId map. */
+    // --- Planner lane adapter state (semantics live in src/planner/planner.ts) ---
+
+    /**
+     * The pure planner lane (note.modified producer, F08-certified),
+     * wired to this plugin's writer. NULL until onload constructs it
+     * (the lane's context needs the adapter, which exists only after
+     * onload's first statement); optional-chained call sites treat
+     * null as a no-op. ARMED only inside startWriter, after the
+     * watcher's drain — pre-arm observations are dropped (Q3,
+     * heal-covered), matching the planner's declared lifecycle.
+     */
+    private plannerLane: PlannerLane | null = null;
+
+    /** Sequential counter backing the TFile->noteId map. */
     private noteIdCounter = 0;
 
     /**
@@ -589,8 +699,47 @@ export default class VaultOverseerIndex extends Plugin {
         await this.loadSettings();
 
         this.adapter = new VaultLogAdapter(this.app.vault.adapter);
+
+        // Planner lane (slot 4, 2026-10-29): constructed once the
+        // adapter exists; observations are dropped pre-arm (Q3,
+        // heal-covered) until startWriter arms it after the watcher's
+        // drain — the same lifecycle shape as the watcher lane, one
+        // boot stage later. Scheduler wired: automatic 30s coalescing
+        // windows via DOM timers (the electron renderer's window is
+        // the ambient clock; handles are numbers on this platform).
+        this.plannerLane = makePlanner(
+            {
+                stat: (path: string) => this.statSnapshot(path),
+                                       contentSha: (path: string) => this.contentShaOf(path),
+                                       appendEvent: async (actor, type, payload) => {
+                                           if (this.log === null) return; // writer dark: drop
+                                           await this.log.appendEvent(actor, type, asModifiedPayload(payload));
+                                       },
+                                       reportIntegrity: async (detail) => {
+                                           if (this.log === null) return;
+                                           await this.log.reportIntegrity(detail);
+                                       },
+                                       // Routing (ruled 2026-10-29): both hooks forward through
+                                       // the create lane, guarded — see routeToCreateLane.
+                                       routeCreate: (path) => this.routeToCreateLane(path, 'spine-unknown'),
+                                       routeRestore: (path) => this.routeToCreateLane(path, 'spine-dead'),
+                                       scheduler: {
+                                           setTimer: (cb, ms) => window.setTimeout(cb, ms),
+                                       clearTimer: (handle) => window.clearTimeout(handle),
+                                       },
+            },
+            {
+                source: this.adapter,
+                eventsDir: EVENTS_DIR,
+            },
+            {
+                windowMs: 30_000, // the map's debouncer figure
+                maxPending: 500, // dark-buffer precedent
+            },
+        );
+
         // manifest.dir is the vault-relative path to this plugin's
-        // folder (obsidian.d.ts l.7378–7381). Typed optional; the
+        // folder (obsidian.d.ts l.7378-7381). Typed optional; the
         // fallback is defensive only — dir is always set at runtime
         // for an installed plugin.
         const pluginFolder =
@@ -606,7 +755,7 @@ export default class VaultOverseerIndex extends Plugin {
             // immediately).
             this.pendingCertification = resolution.foundOrigins;
             new Notice(
-                'Vault Overseer: no origin.txt — open Settings → Vault ' +
+                'Vault Overseer: no origin.txt — open Settings -> Vault ' +
                 'Overseer to certify this machine\'s identity.',
                 15000,
             );
@@ -665,6 +814,17 @@ export default class VaultOverseerIndex extends Plugin {
             );
             this.registerEvent(
                 this.app.vault.on('delete', (file) => this.onVaultDelete(file)),
+            );
+
+            // Modify wiring (slot 4, 2026-10-29): registers with the
+            // other vault listeners, Option-A consistency. Modifies
+            // in the boot window are missed — heal-covered, same
+            // regime as the create window (declared, see header).
+            // Callback param is TAbstractFile per the typings (shape
+            // receipt via typecheck 2026-10-29); onVaultModify guards
+            // with instanceof TFile, same pattern as create/delete.
+            this.registerEvent(
+                this.app.vault.on('modify', (file) => this.onVaultModify(file)),
             );
 
             // Fire and forget: the gate owns its own reporting.
@@ -809,9 +969,20 @@ export default class VaultOverseerIndex extends Plugin {
             // Folder rename: every known path under oldPath/ is stale.
             // Rewrite the gate's addresses; emit nothing yet (pending
             // the folder.renamed transcription ruling).
+            //
+            // KNOWN GAP (slot 4, declared in the header): pending planner
+            // modifies under this prefix SURVIVE the rename — the
+            // planner has no prefix cancel. Systemic fix is folder.renamed
+            // + planner rev B cancelPrefix; not improvised here.
             this.dwellGate.renamePrefix(oldPath, file.path);
             return;
         }
+
+        // Rename cancels the pending modify on the OLD path (planner
+        // ruling 2026-10-28): rename is semantically a modify subclass;
+        // the rename's own post-rename sha check covers content drift.
+        // Quiet — the cancelling event IS the record.
+        this.plannerLane?.cancelPending(oldPath);
 
         // Gate first (synchronous, cheap): accrual truth never depends
         // on the writer's mood. Then the spine fact, ordered by the
@@ -838,6 +1009,40 @@ export default class VaultOverseerIndex extends Plugin {
     // ---------------------------------------------------------------------------
 
     /**
+     * Shared stat at observation time (slot-4 extraction, 2026-10-29 —
+     * was an inline closure in the watcher's deps; identical behavior
+     * and error message). Throws on absent file — callers that must
+     * not propagate route through their own guards.
+     */
+    private async statSnapshot(path: string): Promise<{ mtime: number; bytes: number }> {
+        const stat = await this.app.vault.adapter.stat(path);
+        if (stat === null || stat.type !== 'file') {
+            throw new Error(`Watcher stat: file absent (${path})`);
+        }
+        return { mtime: stat.mtime, bytes: stat.size };
+    }
+
+    /**
+     * Shared content sha (slot-4 extraction, 2026-10-29): SHA-256,
+     * 16 hex chars — the shard convention. One implementation, two
+     * lanes (watcher + planner), zero drift between them.
+     */
+    private async contentShaOf(path: string): Promise<string> {
+        const bytes = await this.app.vault.adapter.readBinary(path);
+        if (bytes === undefined) {
+            throw new Error(`Watcher sha: file absent (${path})`);
+        }
+        const hash = await crypto.subtle.digest(
+            'SHA-256',
+            new Uint8Array(bytes),
+        );
+        return Array.from(new Uint8Array(hash))
+        .map((b) => b.toString(16).padStart(2, '0'))
+        .join('')
+        .slice(0, 16);
+    }
+
+    /**
      * Vault create receipt: filter to md files, forward to the lane.
      * Registered at layout-ready (Option A) — see onload. The lane
      * stats at observation time (mtime/bytes/sha frozen then, even if
@@ -856,14 +1061,66 @@ export default class VaultOverseerIndex extends Plugin {
      * Vault delete receipt: filter to md files, forward to the lane.
      * The lane consumes the last-known sha as a tombstone; absent when
      * the path was never observed (pre-watcher file, rename victim).
+     * The delete also CANCELS any pending planner modify for the path
+     * (tombstone wins — planner ruling 2026-10-28).
      */
     private async onVaultDelete(file: TAbstractFile): Promise<void> {
         if (!(file instanceof TFile)) return;
+        this.plannerLane?.cancelPending(file.path);
         await this.watcherLane.onVaultDelete({
             path: file.path,
             isFolder: false,
             ext: file.extension,
         });
+    }
+
+    // ---------------------------------------------------------------------------
+    // Planner adapter (thin wiring; slot 4, 2026-10-29)
+    // ---------------------------------------------------------------------------
+
+    /**
+     * Vault modify receipt: filter to TFiles, forward to the planner
+     * lane. Callback param is TAbstractFile per the typings (shape
+     * receipt via typecheck 2026-10-29 — TS2739 caught the first
+     * draft's TFile assumption at the registration site); the
+     * instanceof guard is the create/delete pattern, folder modifies
+     * never reaching the lane. Stats at observation time INSIDE the
+     * lane; last-wins per path in the coalescing window; the flush
+     * decides emit vs suppress vs route against flush-time spine
+     * truth.
+     */
+    private async onVaultModify(file: TAbstractFile): Promise<void> {
+        if (!(file instanceof TFile)) return;
+        await this.plannerLane?.onVaultModify({
+            path: file.path,
+            isFolder: false,
+            ext: file.extension,
+        });
+    }
+
+    /**
+     * Planner routing sink (ruled 2026-10-29): a pending modify whose
+     * path the spine never knew (routeCreate) or says is dead
+     * (routeRestore) forwards through the watcher lane's create path.
+     * Both cases converge on S13's semantics — dead-on-spine +
+     * alive-on-disk reconciles by re-creation. GUARDED: the path may
+     * have vanished between observation and routing (folder-rename
+     * stale address); the stat throw is caught and disclosed, never
+     * propagated — a routing throw must not kill the flush loop.
+     */
+    private async routeToCreateLane(path: string, reason: string): Promise<void> {
+        try {
+            await this.watcherLane.onVaultCreate({ path, isFolder: false, ext: 'md' });
+        } catch (err) {
+            const detail =
+            `planner routing (${reason}) failed for '${path}': ` +
+            `${err instanceof Error ? err.message : String(err)} — ` +
+            'observation dropped, heal-covered';
+     console.error('[vault-overseer]', detail);
+     if (this.log !== null) {
+         await this.log.reportIntegrity(detail);
+     }
+        }
     }
 
     // ---------------------------------------------------------------------------
@@ -1007,6 +1264,15 @@ export default class VaultOverseerIndex extends Plugin {
         // this returns. Awaiting makes "armed" a fact the next statement
         // can rely on rather than a hope.
         await this.watcherLane.flushAfterAttach();
+
+        // ARM THE PLANNER after the watcher's drain (ruled 2026-10-29):
+        // the planner's first coalescing flush reads the spine, and this
+        // ordering guarantees the drained dark facts are on it — the
+        // routing decisions (unknown/dead) are made against complete
+        // truth. On the Rung-2 certification path this same statement
+        // arms the lane post-certification; pre-arm observations were
+        // dropped (Q3, heal-covered).
+        this.plannerLane?.arm();
     }
 
     /**
@@ -1019,6 +1285,12 @@ export default class VaultOverseerIndex extends Plugin {
      * Farewell gate ruling (v1, per F09, ratified): dwell below 10s
      * emits NOTHING at session end — a swipe-through doesn't become
      * signal just because Obsidian was closing.
+     *
+     * NO planner farewell flush (slot 4, declared): onunload is
+     * synchronous, the planner's flush is async behind a mergeScan —
+     * its appends would race dispose()'s queue join and drop on
+     * this.log = null. Window loss extends the planner's declared
+     * crash-window limitation; boot-heal is the recovery path.
      */
     onunload(): void {
         // Bank the active note and collect over-gate accruals. The gate
@@ -1099,7 +1371,8 @@ export default class VaultOverseerIndex extends Plugin {
      * matters most — a virgin install's automatic gate fires before
      * certification and refuses (writer dark), so without this call the
      * fresh-spine black hole would wait on a human remembering a button.
-     * startWriter awaits flushAfterAttach, so the lane is armed here.
+     * startWriter awaits flushAfterAttach AND arms the planner, so both
+     * lanes are live here.
      */
     async certifyOrigin(origin: string): Promise<void> {
         const trimmed = origin.trim();
@@ -1123,7 +1396,14 @@ export default class VaultOverseerIndex extends Plugin {
         await this.runReconcileWithVault();
 
         // Force the settings tab to redraw its certification surface away.
-        this.app.setting?.activeTab?.display?.();
+        // TYPECHECK FIX (2026-10-29): `app.setting` is not in Obsidian's
+        // public App typings — this is the internal settings surface,
+        // used deliberately and named here. Contained structural cast,
+        // one call site, optional-chained end to end.
+        const settingsApp = this.app as unknown as {
+            setting?: { activeTab?: { display?: () => void } };
+        };
+        settingsApp.setting?.activeTab?.display?.();
     }
 }
 

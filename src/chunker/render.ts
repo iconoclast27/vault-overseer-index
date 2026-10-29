@@ -2,7 +2,7 @@
 // Vault Overseer — Render Contract (shared, single implementation)
 // src/chunker/render.ts
 //
-// The ONE place that builds the string sent to the embedder. The chunker
+// The ONE place that build the string sent to the embedder. The chunker
 // and the embed path both import from here — two implementations would
 // be two drift opportunities (Chunker Spec Step 6, VC's lesson
 // generalized). Also owns the canonical fm_context serialization and
@@ -39,6 +39,11 @@
 // Known simplification, declared: commas inside quoted bracket-list
 // elements ('[a, "b,c"]') are not respected — the naive split is
 // deterministic, and determinism outranks YAML fidelity here.
+//
+// TYPECHECK FIX (2026-10-29): `assign()` now guards description/type
+//   assignments to reject array values — those fields are scalar-only
+//   per the FmContext interface; array-valued yaml frontmatter for
+//   these keys degrades to null (graceful decline, never crash).
 //
 // Node note: node:crypto, erasable TS, .ts import extensions.
 // =============================================================================
@@ -144,11 +149,24 @@ function stripQuotes(s: string): string {
         return s;
 }
 
+/**
+ * Assign parsed frontmatter value to context. Guarded for scalar-only
+ * fields (description/type): array values are rejected and degrade to
+ * null — graceful decline, never crash (typecheck fix 2026-10-29).
+ */
 function assign(fm: FmContext, key: string, value: string | string[]): void {
     if (key === 'aliases') fm.aliases = value;
     else if (key === 'tags') fm.tags = value;
-    else if (key === 'description') fm.description = value;
-    else if (key === 'type') fm.type = value;
+    else if (key === 'description' && typeof value === 'string') {
+        fm.description = value;
+    }
+    else if (key === 'type' && typeof value === 'string') {
+        fm.type = value;
+    }
+    // Scalar-only fields (description/type) ignore array values; they
+    // degrade to null. This is the typecheck fix — the parseInlineValue
+    // can return string[] for bracket-list syntax, but description/type
+    // cannot hold arrays per the FmContext interface.
 }
 
 function parseInlineValue(rest: string): string | string[] {
@@ -165,7 +183,7 @@ function parseInlineValue(rest: string): string | string[] {
  * degeneracy degrades to fewer keys, down to an empty object — which
  * serializeFmContext maps to null (no fm in the embed input). Dash-list
  * continuations are consumed for every key-shaped line, selected or
- * not, so skipped keys can't leak their items into the next parse.
+ *  not, so skipped keys can't leak their items into the next parse.
  */
 export function parseFmContext(blockText: string): FmContext {
     const fm: FmContext = {};

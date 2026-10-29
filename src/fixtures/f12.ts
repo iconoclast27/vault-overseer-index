@@ -108,6 +108,16 @@
 // ASYNC DISCIPLINE (csuite): ONE main call, every await spelled out,
 // no IIFE scaffolding, no un-awaited promises.
 //
+// TYPECHECK FIX (2026-10-29, Option B): WatcherDeps.appendEvent carries
+//   shape-loose payloads while the typed log API demands the
+//   discriminated union. One bridge helper (asTypedPayload) is applied
+//   at all nine delegation sites; the cast is WITNESSED, not blind —
+//   every scenario below asserts payload parity and key order against
+//   the actual disk bytes, so a drifted shape reds immediately. The
+//   proper fix (typing the watcher lane's payloads at source) is
+//   registered for the watcher's next touch; this keeps the fixture
+//   compile-clean without pretending the loose boundary doesn't exist.
+//
 // Run:  node ./src/fixtures/f12.ts
 // Node note: erasable TS, .ts import extensions.
 // =============================================================================
@@ -115,6 +125,7 @@
 import { spawnContext, shardPath } from '../test-harness.ts';
 import { makeWatcherLane } from '../watcher/watch.ts';
 import type { FileLike, StatSnapshot, WatcherDeps } from '../watcher/watch.ts';
+import type { NoteCreatedPayload, NoteDeletedPayload } from '../eventlog/types.ts';
 
 // -----------------------------------------------------------------------------
 // Helpers
@@ -140,6 +151,18 @@ const FIXED_TS = '2026-10-25T09:00:00+00:00';
 const md = (path: string): FileLike => ({ path, isFolder: false, ext: 'md' });
 const png = (path: string): FileLike => ({ path, isFolder: false, ext: 'png' });
 const folder = (path: string): FileLike => ({ path, isFolder: true, ext: '' });
+
+/**
+ * Typed bridge from the watcher's shape-loose payload to the typed log
+ * API (typecheck fix, 2026-10-29). The watcher lane's type parameter is
+ * already narrowed to note.created | note.deleted, so the target union
+ * is two members. The disk-side parity and key-order assertions in
+ * every scenario are the witnesses that keep this cast honest — a
+ * drifted payload shape fails S1/S3/S8 loudly.
+ */
+function asTypedPayload(p: unknown): NoteCreatedPayload | NoteDeletedPayload {
+    return p as NoteCreatedPayload | NoteDeletedPayload;
+}
 
 /** Parse the shard into events. Key order is law (asserted in S1/S3). */
 function readEvents(
@@ -173,7 +196,7 @@ function statsDeps(
         },
         appendEvent: async (actor, type, payload) => {
             if (onAppend !== undefined && !onAppend()) return;
-            await log.appendEvent(actor, type, payload);
+            await log.appendEvent(actor, type, asTypedPayload(payload));
         },
     };
 }
@@ -218,7 +241,7 @@ async function s1SingleFireCreate(): Promise<void> {
             if (s === undefined) throw new Error(`S1 sha for unknown path ${p}`);
             return s.sha;
         },
-        appendEvent: (actor, type, payload) => log.appendEvent(actor, type, payload),
+        appendEvent: (actor, type, payload) => log.appendEvent(actor, type, asTypedPayload(payload)),
     };
     const lane = makeWatcherLane(deps);
     // ARMING: adapter ritual — writer certified, arm the lane.
@@ -271,7 +294,7 @@ async function s2SilenceContracts(): Promise<void> {
             if (s === undefined) throw new Error(`S2 sha for unknown path ${p}`);
             return s.sha;
         },
-        appendEvent: (actor, type, payload) => log.appendEvent(actor, type, payload),
+        appendEvent: (actor, type, payload) => log.appendEvent(actor, type, asTypedPayload(payload)),
     };
     const lane = makeWatcherLane(deps);
     await lane.flushAfterAttach(); // ARMING
@@ -323,7 +346,7 @@ async function s3UntitledLifecycle(): Promise<void> {
             if (s === undefined) throw new Error(`S3 sha for unknown path ${p}`);
             return s.sha;
         },
-        appendEvent: (actor, type, payload) => log.appendEvent(actor, type, payload),
+        appendEvent: (actor, type, payload) => log.appendEvent(actor, type, asTypedPayload(payload)),
     };
     const lane = makeWatcherLane(deps);
     await lane.flushAfterAttach(); // ARMING
@@ -394,7 +417,7 @@ async function s4DarkBoot(): Promise<void> {
         },
         appendEvent: async (actor, type, payload) => {
             if (!writerLive) return; // dropped by the dead writer
-            await log.appendEvent(actor, type, payload);
+            await log.appendEvent(actor, type, asTypedPayload(payload));
         },
     };
     const lane = makeWatcherLane(deps);
@@ -451,7 +474,7 @@ async function s5StormBurst(): Promise<void> {
             const n = Number(/storm-(\d+)\.md/.exec(p)?.[1] ?? 0);
             return n.toString(16).padStart(16, '0');
         },
-        appendEvent: (actor, type, payload) => log.appendEvent(actor, type, payload),
+        appendEvent: (actor, type, payload) => log.appendEvent(actor, type, asTypedPayload(payload)),
     };
     const lane = makeWatcherLane(deps);
     await lane.flushAfterAttach(); // ARMING
@@ -489,7 +512,7 @@ async function s6SyncAttribution(): Promise<void> {
     const deps: WatcherDeps = {
         stat: async () => ({ mtime: 1763000200000, bytes: 80 }),
         contentSha: async () => 'abcabcabcabcdef0',
-        appendEvent: (actor, type, payload) => log.appendEvent(actor, type, payload),
+        appendEvent: (actor, type, payload) => log.appendEvent(actor, type, asTypedPayload(payload)),
     };
     const lane = makeWatcherLane(deps);
     await lane.flushAfterAttach(); // ARMING
@@ -535,7 +558,7 @@ async function s7Overflow(): Promise<void> {
         },
         appendEvent: async (actor, type, payload) => {
             if (!writerLive) return;
-            await log.appendEvent(actor, type, payload);
+            await log.appendEvent(actor, type, asTypedPayload(payload));
         },
         reportIntegrity: async (detail) => {
             if (!writerLive) return;
@@ -600,7 +623,7 @@ async function s8UnknownDelete(): Promise<void> {
         contentSha: async (p) => {
             throw new Error(`S8 sha called for ${p} — delete must not sha`);
         },
-        appendEvent: (actor, type, payload) => log.appendEvent(actor, type, payload),
+        appendEvent: (actor, type, payload) => log.appendEvent(actor, type, asTypedPayload(payload)),
     };
     const lane = makeWatcherLane(deps);
     await lane.flushAfterAttach(); // ARMING

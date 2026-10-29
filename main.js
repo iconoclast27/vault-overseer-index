@@ -28,28 +28,27 @@ var import_obsidian = require("obsidian");
 // src/eventlog/types.ts
 var SCHEMA_VERSION = 1;
 function payloadInOrder(event) {
-  const p = event.payload;
   switch (event.type) {
     case "note.created":
-      return { path: p.path, mtime: p.mtime, bytes: p.bytes, content_sha: p.content_sha };
+      return { path: event.payload.path, mtime: event.payload.mtime, bytes: event.payload.bytes, content_sha: event.payload.content_sha };
     case "note.modified":
-      return { path: p.path, mtime: p.mtime, bytes: p.bytes, content_sha: p.content_sha };
+      return { path: event.payload.path, mtime: event.payload.mtime, bytes: event.payload.bytes, content_sha: event.payload.content_sha };
     case "note.deleted":
-      return { path: p.path, last_content_sha: p.last_content_sha };
+      return { path: event.payload.path, last_content_sha: event.payload.last_content_sha };
     case "note.renamed":
-      return { from: p.from, to: p.to };
+      return { from: event.payload.from, to: event.payload.to };
     case "note.conflicted":
-      return { path: p.path, conflict_copy_path: p.conflict_copy_path };
+      return { path: event.payload.path, conflict_copy_path: event.payload.conflict_copy_path };
     case "note.opened":
-      return { path: p.path, dwell: p.dwell };
+      return { path: event.payload.path, dwell: event.payload.dwell };
     case "chunk.indexed":
-      return { path: p.path, ord: p.ord, bs: p.bs, be: p.be, vh: p.vh, cp: p.cp };
+      return { path: event.payload.path, ord: event.payload.ord, bs: event.payload.bs, be: event.payload.be, vh: event.payload.vh, cp: event.payload.cp };
     case "chunk.evicted":
-      return { vh: p.vh, path: p.path };
+      return { vh: event.payload.vh, path: event.payload.path };
     case "log.integrity":
-      return { detail: p.detail };
+      return { detail: event.payload.detail };
     case "log.checkpoint":
-      return { last_seq: p.last_seq, events: p.events, digest: p.digest };
+      return { last_seq: event.payload.last_seq, events: event.payload.events, digest: event.payload.digest };
     default: {
       const unreachable = event;
       return { detail: `unreachable: ${JSON.stringify(unreachable)}` };
@@ -186,6 +185,8 @@ var EventLog = class {
   hasTornTail;
   /** Serialized append queue: one write at a time, ever. */
   queueTail = Promise.resolve();
+  /** Subscriber seam — live taps on the serialized queue. */
+  subscribers = [];
   constructor(opts) {
     this.adapter = opts.adapter;
     this.origin = opts.origin;
@@ -242,6 +243,22 @@ var EventLog = class {
   get pendingCount() {
     return this.buffer.length;
   }
+  /**
+   * Subscriber seam: register a live tap on the serialized queue.
+   * Callback fires after every successful appendEvent() commit.
+   * @param name Optional identifier for error reporting
+   * @returns Unsubscribe handle (idempotent)
+   */
+  subscribe(name, cb) {
+    const subscriber = { name, cb };
+    this.subscribers.push(subscriber);
+    return () => {
+      const idx = this.subscribers.indexOf(subscriber);
+      if (idx !== -1) {
+        this.subscribers.splice(idx, 1);
+      }
+    };
+  }
   // ---------------------------------------------------------------------------
   // Internals — everything below runs inside the serialized queue
   // ---------------------------------------------------------------------------
@@ -263,20 +280,21 @@ var EventLog = class {
     };
     const line = serializeEvent(event);
     if (TIER2_TYPES.has(type)) {
-      this.buffer.push(line);
+      this.buffer.push({ line, event });
       this.scheduleIdleFlush();
       if (this.buffer.length >= this.hardCap || this.buffer.length >= this.flushCount) {
         await this.flushLocked();
       }
       return;
     }
-    const combined = this.buffer.length > 0 ? this.buffer.join("") + line : line;
+    const combined = this.buffer.length > 0 ? this.buffer.map((b) => b.line).join("") + line : line;
     try {
       const writeData = this.hasTornTail ? "\n" + combined : combined;
       this.hasTornTail = false;
       await this.adapter.append(this.shardPath, writeData);
       this.buffer = [];
       this.stopIdleFlush();
+      this.notifySubscribers(event);
     } catch (err) {
       this.seq = seq - 1;
       throw err;
@@ -284,8 +302,11 @@ var EventLog = class {
   }
   async flushLocked() {
     if (this.buffer.length === 0) return;
-    const combined = this.buffer.join("");
+    const combined = this.buffer.map((b) => b.line).join("");
     await this.adapter.append(this.shardPath, combined);
+    for (const { event } of this.buffer) {
+      this.notifySubscribers(event);
+    }
     this.buffer = [];
     this.stopIdleFlush();
   }
@@ -318,9 +339,36 @@ var EventLog = class {
     this.hasTornTail = false;
     try {
       await this.adapter.append(this.shardPath, writeData);
+      this.notifySubscribers(event);
     } catch (err) {
       this.seq = seq - 1;
       throw err;
+    }
+  }
+  /**
+   * Fire all registered subscribers. Errors are logged, never propagated.
+   * Called only after successful disk append.
+   *
+   * HAZARD RULING (2026-10-29): a subscriber throwing on log.integrity
+   * would create an unbounded self-loop (throw → reportIntegrity →
+   * integrity event → fanout → throw → ...). The fix: skip fanout for
+   * integrity events born of subscriber errors. Logs once to error
+   * channel, no recursion. F13 certifies containment before and after.
+   */
+  notifySubscribers(event) {
+    for (const { name, cb } of this.subscribers) {
+      try {
+        cb(event);
+      } catch (err) {
+        const who = name ?? "<anonymous>";
+        if (event.type !== "log.integrity") {
+          void this.reportIntegrity(
+            `subscriber threw: ${who} \u2014 ${String(err)}`
+          );
+        } else {
+          console.error(`[eventlog] subscriber threw on integrity event: ${who} \u2014 ${String(err)}`);
+        }
+      }
     }
   }
   async ensureShardLocked() {
@@ -572,8 +620,11 @@ function stripQuotes(s) {
 function assign(fm, key, value) {
   if (key === "aliases") fm.aliases = value;
   else if (key === "tags") fm.tags = value;
-  else if (key === "description") fm.description = value;
-  else if (key === "type") fm.type = value;
+  else if (key === "description" && typeof value === "string") {
+    fm.description = value;
+  } else if (key === "type" && typeof value === "string") {
+    fm.type = value;
+  }
 }
 function parseInlineValue(rest) {
   if (rest.startsWith("[") && rest.endsWith("]")) {
@@ -1201,12 +1252,190 @@ function makeWatcherLane(deps, options = {}) {
   };
 }
 
+// src/planner/planner.ts
+function lastStateByPath(events) {
+  const state = /* @__PURE__ */ new Map();
+  for (const e of events) {
+    const t = String(e.type);
+    if (t === "note.created" || t === "note.modified") {
+      if (typeof e.path === "string" && typeof e.mtime === "number" && typeof e.bytes === "number" && typeof e.content_sha === "string") {
+        state.set(e.path, {
+          mtime: e.mtime,
+          bytes: e.bytes,
+          content_sha: e.content_sha
+        });
+      }
+    } else if (t === "note.renamed") {
+      const from = e.from;
+      const to = e.to;
+      if (typeof from === "string" && typeof to === "string") {
+        const carried = state.get(from);
+        state.delete(from);
+        if (carried !== void 0) {
+          state.set(to, carried);
+        }
+      }
+    } else if (t === "note.deleted") {
+      if (typeof e.path === "string") {
+        state.delete(e.path);
+      }
+    }
+  }
+  return state;
+}
+function makePlanner(deps, ctx, options = {}) {
+  const windowMs = options.windowMs ?? 3e4;
+  const maxPending = options.maxPending ?? 500;
+  const pending = /* @__PURE__ */ new Map();
+  let armed = false;
+  let droppedOverflow = 0;
+  let timerHandle = null;
+  let inFlight = null;
+  async function integrity(detail) {
+    if (deps.reportIntegrity !== void 0) {
+      await deps.reportIntegrity(detail);
+    }
+  }
+  function isEmittable(file) {
+    if (file.isFolder) return false;
+    return file.ext.toLowerCase() === "md";
+  }
+  function scheduleWindow() {
+    if (deps.scheduler === void 0) return;
+    if (timerHandle !== null) return;
+    timerHandle = deps.scheduler.setTimer(() => {
+      timerHandle = null;
+      void flush();
+    }, windowMs);
+  }
+  function cancelWindow() {
+    if (deps.scheduler !== void 0 && timerHandle !== null) {
+      deps.scheduler.clearTimer(timerHandle);
+      timerHandle = null;
+    }
+  }
+  async function onVaultModify(file) {
+    if (!armed) return;
+    if (!isEmittable(file)) return;
+    const stat = await deps.stat(file.path);
+    const sha = await deps.contentSha(file.path);
+    if (!pending.has(file.path) && pending.size >= maxPending) {
+      const oldest = pending.keys().next().value;
+      if (oldest !== void 0) {
+        pending.delete(oldest);
+        droppedOverflow++;
+      }
+    }
+    pending.set(file.path, {
+      path: file.path,
+      mtime: stat.mtime,
+      bytes: stat.bytes,
+      content_sha: sha
+    });
+    scheduleWindow();
+  }
+  async function runFlush() {
+    if (pending.size === 0) {
+      return { emitted: 0, suppressed: 0, routedCreate: 0, routedRestore: 0, refused: false };
+    }
+    cancelWindow();
+    const batch = [...pending.entries()].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
+    pending.clear();
+    if (droppedOverflow > 0) {
+      const n = droppedOverflow;
+      droppedOverflow = 0;
+      await integrity(
+        `planner coalescing overflow: ${n} pending modify observations dropped (oldest) \u2014 window exceeded distinct-path cap`
+      );
+    }
+    const scan = await mergeScan(ctx.source, ctx.eventsDir);
+    if (scan.gaps.length > 0) {
+      for (const g of scan.gaps) {
+        await integrity(
+          `planner refused: seq gap (origin: ${g.origin}, expected_seq: ${g.expected_seq}, got_seq: ${g.got_seq}) \u2014 spine must be contiguous before modification emission; ${batch.length} pending observations dropped, heal is the recovery path`
+        );
+      }
+      return { emitted: 0, suppressed: 0, routedCreate: 0, routedRestore: 0, refused: true };
+    }
+    const { livePaths, deadPaths } = projectPaths(scan.events);
+    const stateByPath = lastStateByPath(scan.events);
+    let emitted = 0;
+    let suppressed = 0;
+    let routedCreate = 0;
+    let routedRestore = 0;
+    for (const [, fact] of batch) {
+      if (!livePaths.has(fact.path)) {
+        if (deadPaths.has(fact.path)) {
+          if (deps.routeRestore !== void 0) {
+            await deps.routeRestore(fact.path);
+            routedRestore++;
+          } else {
+            await integrity(
+              `planner: spine-dead path with pending modify (path: ${fact.path}) \u2014 routeRestore unwired, observation dropped (heal-covered)`
+            );
+          }
+        } else {
+          if (deps.routeCreate !== void 0) {
+            await deps.routeCreate(fact.path);
+            routedCreate++;
+          } else {
+            await integrity(
+              `planner: spine-unknown path with pending modify (path: ${fact.path}) \u2014 routeCreate unwired, observation dropped (heal-covered)`
+            );
+          }
+        }
+        continue;
+      }
+      const recorded = stateByPath.get(fact.path);
+      if (recorded !== void 0 && recorded.mtime === fact.mtime && recorded.content_sha === fact.content_sha) {
+        suppressed++;
+        continue;
+      }
+      await deps.appendEvent("user", "note.modified", {
+        path: fact.path,
+        mtime: fact.mtime,
+        bytes: fact.bytes,
+        content_sha: fact.content_sha
+      });
+      emitted++;
+    }
+    return { emitted, suppressed, routedCreate, routedRestore, refused: false };
+  }
+  function flush() {
+    if (inFlight !== null) return inFlight;
+    inFlight = runFlush().finally(() => {
+      inFlight = null;
+    });
+    return inFlight;
+  }
+  return {
+    onVaultModify,
+    cancelPending(path) {
+      pending.delete(path);
+      if (pending.size === 0) cancelWindow();
+    },
+    arm() {
+      armed = true;
+    },
+    flush,
+    get pendingCount() {
+      return pending.size;
+    }
+  };
+}
+
 // src/main.ts
 var EVENTS_DIR = "_vault-index/events";
 var ORIGIN_FILE = "origin.txt";
 var RECONCILE_REFUSED_DARK = -1;
 var RECONCILE_REFUSED_GAP = -2;
 var DEFAULT_SETTINGS = {};
+function asTypedPayload(p) {
+  return p;
+}
+function asModifiedPayload(p) {
+  return p;
+}
 var VaultLogAdapter = class {
   constructor(inner) {
     this.inner = inner;
@@ -1282,7 +1511,6 @@ async function writeOriginFile(adapter, pluginFolder, origin) {
 `);
 }
 var VaultOverseerIndex = class extends import_obsidian.Plugin {
-  settings;
   log = null;
   /** The resolved machine identity — never sourced from data.json. */
   originId = null;
@@ -1328,30 +1556,18 @@ var VaultOverseerIndex = class extends import_obsidian.Plugin {
    * so the lane exists before onload but cannot emit into a dark
    * writer. Dark-buffer cap defaults to 500 per session ruling
    * 2026-10-25.
+   *
+   * Slot-4 refactor (2026-10-29): stat/sha extracted to private
+   * helpers, shared with the planner lane — behavior-identical,
+   * same error messages.
    */
   watcherLane = makeWatcherLane(
     {
-      stat: async (path) => {
-        const stat = await this.app.vault.adapter.stat(path);
-        if (stat === null || stat.type !== "file") {
-          throw new Error(`Watcher stat: file absent (${path})`);
-        }
-        return { mtime: stat.mtime, bytes: stat.size };
-      },
-      contentSha: async (path) => {
-        const bytes = await this.app.vault.adapter.readBinary(path);
-        if (bytes === void 0) {
-          throw new Error(`Watcher sha: file absent (${path})`);
-        }
-        const hash = await crypto.subtle.digest(
-          "SHA-256",
-          new Uint8Array(bytes)
-        );
-        return Array.from(new Uint8Array(hash)).map((b) => b.toString(16).padStart(2, "0")).join("").slice(0, 16);
-      },
+      stat: (path) => this.statSnapshot(path),
+      contentSha: (path) => this.contentShaOf(path),
       appendEvent: async (actor, type, payload) => {
         if (this.log === null) return;
-        await this.log.appendEvent(actor, type, payload);
+        await this.log.appendEvent(actor, type, asTypedPayload(payload));
       },
       reportIntegrity: async (detail) => {
         if (this.log === null) return;
@@ -1360,7 +1576,18 @@ var VaultOverseerIndex = class extends import_obsidian.Plugin {
     },
     { darkBufferCap: 500 }
   );
-  /** Sequential counter backing the TFile→noteId map. */
+  // --- Planner lane adapter state (semantics live in src/planner/planner.ts) ---
+  /**
+   * The pure planner lane (note.modified producer, F08-certified),
+   * wired to this plugin's writer. NULL until onload constructs it
+   * (the lane's context needs the adapter, which exists only after
+   * onload's first statement); optional-chained call sites treat
+   * null as a no-op. ARMED only inside startWriter, after the
+   * watcher's drain — pre-arm observations are dropped (Q3,
+   * heal-covered), matching the planner's declared lifecycle.
+   */
+  plannerLane = null;
+  /** Sequential counter backing the TFile->noteId map. */
   noteIdCounter = 0;
   /**
    * Opaque note-id per TFile (collision fix, 2026-10-24). Obsidian
@@ -1375,12 +1602,44 @@ var VaultOverseerIndex = class extends import_obsidian.Plugin {
   async onload() {
     await this.loadSettings();
     this.adapter = new VaultLogAdapter(this.app.vault.adapter);
+    this.plannerLane = makePlanner(
+      {
+        stat: (path) => this.statSnapshot(path),
+        contentSha: (path) => this.contentShaOf(path),
+        appendEvent: async (actor, type, payload) => {
+          if (this.log === null) return;
+          await this.log.appendEvent(actor, type, asModifiedPayload(payload));
+        },
+        reportIntegrity: async (detail) => {
+          if (this.log === null) return;
+          await this.log.reportIntegrity(detail);
+        },
+        // Routing (ruled 2026-10-29): both hooks forward through
+        // the create lane, guarded — see routeToCreateLane.
+        routeCreate: (path) => this.routeToCreateLane(path, "spine-unknown"),
+        routeRestore: (path) => this.routeToCreateLane(path, "spine-dead"),
+        scheduler: {
+          setTimer: (cb, ms) => window.setTimeout(cb, ms),
+          clearTimer: (handle) => window.clearTimeout(handle)
+        }
+      },
+      {
+        source: this.adapter,
+        eventsDir: EVENTS_DIR
+      },
+      {
+        windowMs: 3e4,
+        // the map's debouncer figure
+        maxPending: 500
+        // dark-buffer precedent
+      }
+    );
     const pluginFolder = this.manifest.dir ?? `.obsidian/plugins/${this.manifest.id}`;
     const resolution = await resolveOrigin(this.adapter, pluginFolder);
     if (resolution.origin === null) {
       this.pendingCertification = resolution.foundOrigins;
       new import_obsidian.Notice(
-        "Vault Overseer: no origin.txt \u2014 open Settings \u2192 Vault Overseer to certify this machine's identity.",
+        "Vault Overseer: no origin.txt \u2014 open Settings -> Vault Overseer to certify this machine's identity.",
         15e3
       );
     } else {
@@ -1398,6 +1657,9 @@ var VaultOverseerIndex = class extends import_obsidian.Plugin {
       );
       this.registerEvent(
         this.app.vault.on("delete", (file) => this.onVaultDelete(file))
+      );
+      this.registerEvent(
+        this.app.vault.on("modify", (file) => this.onVaultModify(file))
       );
       void this.runReconcileWithVault();
     });
@@ -1504,6 +1766,7 @@ var VaultOverseerIndex = class extends import_obsidian.Plugin {
       this.dwellGate.renamePrefix(oldPath, file.path);
       return;
     }
+    this.plannerLane?.cancelPending(oldPath);
     this.dwellGate.renamePath(oldPath, file.path);
     void this.emitRename(oldPath, file.path);
   }
@@ -1523,6 +1786,35 @@ var VaultOverseerIndex = class extends import_obsidian.Plugin {
   // Watcher adapter (thin wiring; F12, 2026-10-25)
   // ---------------------------------------------------------------------------
   /**
+   * Shared stat at observation time (slot-4 extraction, 2026-10-29 —
+   * was an inline closure in the watcher's deps; identical behavior
+   * and error message). Throws on absent file — callers that must
+   * not propagate route through their own guards.
+   */
+  async statSnapshot(path) {
+    const stat = await this.app.vault.adapter.stat(path);
+    if (stat === null || stat.type !== "file") {
+      throw new Error(`Watcher stat: file absent (${path})`);
+    }
+    return { mtime: stat.mtime, bytes: stat.size };
+  }
+  /**
+   * Shared content sha (slot-4 extraction, 2026-10-29): SHA-256,
+   * 16 hex chars — the shard convention. One implementation, two
+   * lanes (watcher + planner), zero drift between them.
+   */
+  async contentShaOf(path) {
+    const bytes = await this.app.vault.adapter.readBinary(path);
+    if (bytes === void 0) {
+      throw new Error(`Watcher sha: file absent (${path})`);
+    }
+    const hash = await crypto.subtle.digest(
+      "SHA-256",
+      new Uint8Array(bytes)
+    );
+    return Array.from(new Uint8Array(hash)).map((b) => b.toString(16).padStart(2, "0")).join("").slice(0, 16);
+  }
+  /**
    * Vault create receipt: filter to md files, forward to the lane.
    * Registered at layout-ready (Option A) — see onload. The lane
    * stats at observation time (mtime/bytes/sha frozen then, even if
@@ -1540,14 +1832,60 @@ var VaultOverseerIndex = class extends import_obsidian.Plugin {
    * Vault delete receipt: filter to md files, forward to the lane.
    * The lane consumes the last-known sha as a tombstone; absent when
    * the path was never observed (pre-watcher file, rename victim).
+   * The delete also CANCELS any pending planner modify for the path
+   * (tombstone wins — planner ruling 2026-10-28).
    */
   async onVaultDelete(file) {
     if (!(file instanceof import_obsidian.TFile)) return;
+    this.plannerLane?.cancelPending(file.path);
     await this.watcherLane.onVaultDelete({
       path: file.path,
       isFolder: false,
       ext: file.extension
     });
+  }
+  // ---------------------------------------------------------------------------
+  // Planner adapter (thin wiring; slot 4, 2026-10-29)
+  // ---------------------------------------------------------------------------
+  /**
+   * Vault modify receipt: filter to TFiles, forward to the planner
+   * lane. Callback param is TAbstractFile per the typings (shape
+   * receipt via typecheck 2026-10-29 — TS2739 caught the first
+   * draft's TFile assumption at the registration site); the
+   * instanceof guard is the create/delete pattern, folder modifies
+   * never reaching the lane. Stats at observation time INSIDE the
+   * lane; last-wins per path in the coalescing window; the flush
+   * decides emit vs suppress vs route against flush-time spine
+   * truth.
+   */
+  async onVaultModify(file) {
+    if (!(file instanceof import_obsidian.TFile)) return;
+    await this.plannerLane?.onVaultModify({
+      path: file.path,
+      isFolder: false,
+      ext: file.extension
+    });
+  }
+  /**
+   * Planner routing sink (ruled 2026-10-29): a pending modify whose
+   * path the spine never knew (routeCreate) or says is dead
+   * (routeRestore) forwards through the watcher lane's create path.
+   * Both cases converge on S13's semantics — dead-on-spine +
+   * alive-on-disk reconciles by re-creation. GUARDED: the path may
+   * have vanished between observation and routing (folder-rename
+   * stale address); the stat throw is caught and disclosed, never
+   * propagated — a routing throw must not kill the flush loop.
+   */
+  async routeToCreateLane(path, reason) {
+    try {
+      await this.watcherLane.onVaultCreate({ path, isFolder: false, ext: "md" });
+    } catch (err) {
+      const detail = `planner routing (${reason}) failed for '${path}': ${err instanceof Error ? err.message : String(err)} \u2014 observation dropped, heal-covered`;
+      console.error("[vault-overseer]", detail);
+      if (this.log !== null) {
+        await this.log.reportIntegrity(detail);
+      }
+    }
   }
   // ---------------------------------------------------------------------------
   // Writer boot
@@ -1623,6 +1961,7 @@ var VaultOverseerIndex = class extends import_obsidian.Plugin {
       await this.log.reportIntegrity(`heal scan threw: ${detail}`);
     }
     await this.watcherLane.flushAfterAttach();
+    this.plannerLane?.arm();
   }
   /**
    * SYNCHRONOUS, and the order below is load-bearing: farewell dwell
@@ -1634,6 +1973,12 @@ var VaultOverseerIndex = class extends import_obsidian.Plugin {
    * Farewell gate ruling (v1, per F09, ratified): dwell below 10s
    * emits NOTHING at session end — a swipe-through doesn't become
    * signal just because Obsidian was closing.
+   *
+   * NO planner farewell flush (slot 4, declared): onunload is
+   * synchronous, the planner's flush is async behind a mergeScan —
+   * its appends would race dispose()'s queue join and drop on
+   * this.log = null. Window loss extends the planner's declared
+   * crash-window limitation; boot-heal is the recovery path.
    */
   onunload() {
     const farewells = this.dwellGate.sessionEnd();
@@ -1694,7 +2039,8 @@ var VaultOverseerIndex = class extends import_obsidian.Plugin {
    * matters most — a virgin install's automatic gate fires before
    * certification and refuses (writer dark), so without this call the
    * fresh-spine black hole would wait on a human remembering a button.
-   * startWriter awaits flushAfterAttach, so the lane is armed here.
+   * startWriter awaits flushAfterAttach AND arms the planner, so both
+   * lanes are live here.
    */
   async certifyOrigin(origin) {
     const trimmed = origin.trim();
@@ -1708,7 +2054,8 @@ var VaultOverseerIndex = class extends import_obsidian.Plugin {
     this.pendingCertification = null;
     await this.startWriter(this.adapter, trimmed, false);
     await this.runReconcileWithVault();
-    this.app.setting?.activeTab?.display?.();
+    const settingsApp = this.app;
+    settingsApp.setting?.activeTab?.display?.();
   }
 };
 var OverseerSettingTab = class extends import_obsidian.PluginSettingTab {

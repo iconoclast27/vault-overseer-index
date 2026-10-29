@@ -33,6 +33,21 @@
 //     per checkpoint, milliseconds at single-digit MB/year.
 //   - Coverage invariant: checkpoint at seq S covers 1..S−1
 //     (policed by verifyChain + F11; never-fabricate).
+//
+// Subscriber seam (rev. 2026-10-29):
+//   - subscribe(name?, cb): register a live tap on the serialized queue
+//   - unsubscribe(): returned handle, idempotent
+//   - Notifications fire AFTER disk append succeeds (Tier-2 included)
+//   - Subscriber errors are logged, never propagated to the writer
+//
+// SUBSCRIBER-THROW HAZARD RULING (rev. 2026-10-29):
+//   A subscriber that throws on EVERY event, including log.integrity,
+//   creates a SELF-SUSTAINING LOOP — throw → reportIntegrity → new
+//   integrity event → fanout → throw → ... unbounded shard growth.
+//   Fixed: notifySubscribers() skips fanout for integrity events born
+//   of subscriber errors. Logs once to error channel, no unbounded
+//   recursion. F13 certified the containment before the fix; F13 re-runs
+//   green after the fix as the witness. The hazard is retired, not parked.
 // =============================================================================
 
 import type {
@@ -92,6 +107,13 @@ const TIER2_TYPES: ReadonlySet<EventType> = new Set<EventType>([
 
 const DEFAULT_EVENTS_DIR = '_vault-index/events';
 
+// Subscriber seam — internal types
+type SubscriberCallback = (event: VaultOverseerEvent) => void;
+interface Subscriber {
+    readonly name?: string;
+    readonly cb: SubscriberCallback;
+}
+
 export class EventLog {
     private readonly adapter: LogAdapter;
     private readonly origin: string;
@@ -105,13 +127,16 @@ export class EventLog {
     private sinceCheckpoint = 0;
 
     private seq: number;
-    private buffer: string[] = [];
+    private buffer: Array<{ line: string; event: VaultOverseerEvent }> = [];
     private ready = false;
     private idleTimer: ReturnType<typeof setTimeout> | null = null;
     private hasTornTail: boolean;
 
     /** Serialized append queue: one write at a time, ever. */
     private queueTail: Promise<void> = Promise.resolve();
+
+    /** Subscriber seam — live taps on the serialized queue. */
+    private subscribers: Subscriber[] = [];
 
     constructor(opts: EventLogOptions) {
         this.adapter = opts.adapter;
@@ -181,6 +206,23 @@ export class EventLog {
         return this.buffer.length;
     }
 
+    /**
+     * Subscriber seam: register a live tap on the serialized queue.
+     * Callback fires after every successful appendEvent() commit.
+     * @param name Optional identifier for error reporting
+     * @returns Unsubscribe handle (idempotent)
+     */
+    subscribe(name: string | undefined, cb: SubscriberCallback): () => void {
+        const subscriber: Subscriber = { name, cb };
+        this.subscribers.push(subscriber);
+        return () => {
+            const idx = this.subscribers.indexOf(subscriber);
+            if (idx !== -1) {
+                this.subscribers.splice(idx, 1);
+            }
+        };
+    }
+
     // ---------------------------------------------------------------------------
     // Internals — everything below runs inside the serialized queue
     // ---------------------------------------------------------------------------
@@ -213,7 +255,7 @@ export class EventLog {
         const line = serializeLine(event);
 
         if (TIER2_TYPES.has(type)) {
-            this.buffer.push(line);
+            this.buffer.push({ line, event });
             this.scheduleIdleFlush();
             if (this.buffer.length >= this.hardCap || this.buffer.length >= this.flushCount) {
                 await this.flushLocked();
@@ -224,7 +266,9 @@ export class EventLog {
         // Tier 1: carry the buffer ahead of this line so disk order == seq
         // order, in a single append. On failure: buffer survives for retry,
         // this event's seq rolls back.
-        const combined = this.buffer.length > 0 ? this.buffer.join('') + line : line;
+        const combined = this.buffer.length > 0
+        ? this.buffer.map(b => b.line).join('') + line
+        : line;
         try {
             // Torn-tail resume: prepend '\n' on first append so the torn fragment
             // becomes a dead line (skipped by reader), subsequent lines stay clean.
@@ -233,6 +277,8 @@ export class EventLog {
             await this.adapter.append(this.shardPath, writeData);
             this.buffer = [];
             this.stopIdleFlush();
+            // Notify subscribers AFTER disk append succeeds
+            this.notifySubscribers(event);
         } catch (err) {
             this.seq = seq - 1; // roll back — this seq was never written
             throw err;
@@ -241,8 +287,12 @@ export class EventLog {
 
     private async flushLocked(): Promise<void> {
         if (this.buffer.length === 0) return;
-        const combined = this.buffer.join('');
+        const combined = this.buffer.map(b => b.line).join('');
         await this.adapter.append(this.shardPath, combined);
+        // Notify subscribers AFTER disk append succeeds
+        for (const { event } of this.buffer) {
+            this.notifySubscribers(event);
+        }
         this.buffer = [];
         this.stopIdleFlush();
     }
@@ -277,9 +327,41 @@ export class EventLog {
         this.hasTornTail = false;
         try {
             await this.adapter.append(this.shardPath, writeData);
+            // Notify subscribers AFTER disk append succeeds
+            this.notifySubscribers(event);
         } catch (err) {
             this.seq = seq - 1; // roll back — this seq was never written
             throw err;
+        }
+    }
+
+    /**
+     * Fire all registered subscribers. Errors are logged, never propagated.
+     * Called only after successful disk append.
+     *
+     * HAZARD RULING (2026-10-29): a subscriber throwing on log.integrity
+     * would create an unbounded self-loop (throw → reportIntegrity →
+     * integrity event → fanout → throw → ...). The fix: skip fanout for
+     * integrity events born of subscriber errors. Logs once to error
+     * channel, no recursion. F13 certifies containment before and after.
+     */
+    private notifySubscribers(event: VaultOverseerEvent): void {
+        for (const { name, cb } of this.subscribers) {
+            try {
+                cb(event);
+            } catch (err) {
+                const who = name ?? '<anonymous>';
+                // Skip fanout for integrity errors — prevents unbounded recursion
+                // if a subscriber throws on log.integrity events.
+                if (event.type !== 'log.integrity') {
+                    void this.reportIntegrity(
+                        `subscriber threw: ${who} — ${String(err)}`,
+                    );
+                } else {
+                    // Still log to console.error for debugging, but don't re-enqueue
+                    console.error(`[eventlog] subscriber threw on integrity event: ${who} — ${String(err)}`);
+                }
+            }
         }
     }
 

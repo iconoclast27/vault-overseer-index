@@ -20,6 +20,14 @@
 //   - Line format: compact JSON, one event per line, '\n'-terminated.
 //     The trailing newline is the completeness marker — F01's torn-tail
 //     detection is precisely "final line lacks its terminator."
+//
+// FIX NOTE (2026-10-29): payloadInOrder formerly hoisted `const p =
+//   event.payload` ABOVE the switch, severing the discriminant narrowing
+//   — 28 TS2339 errors, declared debt since the first-ever typecheck
+//   (2026-10-28). Each case now accesses `event.payload` directly so
+//   narrowing flows from `event.type`. Behavior is UNCHANGED: the same
+//   fields in the same order produce the same bytes. Runtime was never
+//   wrong; the checker was never satisfied.
 // =============================================================================
 
 /** Envelope schema version. Forward-only migrations keyed on this. */
@@ -181,30 +189,33 @@ export type VaultOverseerEvent =
  * Build the payload object with fields in normative order.
  * Exhaustive over the Phase 1 union: adding an EventType without adding
  * a case is a compile error via the `never` assignment check.
+ *
+ * FIX 2026-10-29: each case reads `event.payload` directly — the hoisted
+ * `const p` severed the type narrowing. No behavior change; narrowing now
+ * flows from the discriminant as designed.
  */
 function payloadInOrder(event: VaultOverseerEvent): Record<string, unknown> {
-    const p = event.payload;
     switch (event.type) {
         case 'note.created':
-            return { path: p.path, mtime: p.mtime, bytes: p.bytes, content_sha: p.content_sha };
+            return { path: event.payload.path, mtime: event.payload.mtime, bytes: event.payload.bytes, content_sha: event.payload.content_sha };
         case 'note.modified':
-            return { path: p.path, mtime: p.mtime, bytes: p.bytes, content_sha: p.content_sha };
+            return { path: event.payload.path, mtime: event.payload.mtime, bytes: event.payload.bytes, content_sha: event.payload.content_sha };
         case 'note.deleted':
-            return { path: p.path, last_content_sha: p.last_content_sha };
+            return { path: event.payload.path, last_content_sha: event.payload.last_content_sha };
         case 'note.renamed':
-            return { from: p.from, to: p.to };
+            return { from: event.payload.from, to: event.payload.to };
         case 'note.conflicted':
-            return { path: p.path, conflict_copy_path: p.conflict_copy_path };
+            return { path: event.payload.path, conflict_copy_path: event.payload.conflict_copy_path };
         case 'note.opened':
-            return { path: p.path, dwell: p.dwell };
+            return { path: event.payload.path, dwell: event.payload.dwell };
         case 'chunk.indexed':
-            return { path: p.path, ord: p.ord, bs: p.bs, be: p.be, vh: p.vh, cp: p.cp };
+            return { path: event.payload.path, ord: event.payload.ord, bs: event.payload.bs, be: event.payload.be, vh: event.payload.vh, cp: event.payload.cp };
         case 'chunk.evicted':
-            return { vh: p.vh, path: p.path };
+            return { vh: event.payload.vh, path: event.payload.path };
         case 'log.integrity':
-            return { detail: p.detail };
+            return { detail: event.payload.detail };
         case 'log.checkpoint':
-            return { last_seq: p.last_seq, events: p.events, digest: p.digest };
+            return { last_seq: event.payload.last_seq, events: event.payload.events, digest: event.payload.digest };
         default: {
             // Compile-time exhaustiveness: unknown event types cannot occur.
             const unreachable: never = event;

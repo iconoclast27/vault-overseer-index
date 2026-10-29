@@ -24,6 +24,15 @@
 // received-vs-sent); no single-file witness exists for it. F11 asserts
 // what is true.
 //
+// FIX NOTE (2026-10-29): scenario 2's boundary assertion searched raw
+//   Uint8Array bytes with a string needle — TypedArray.includes takes a
+//   NUMBER, so the string coerced to NaN and the check silently
+//   evaluated false in every runtime (if it ever ran green, it was a
+//   coincidence of the older code). Rewritten via countSubstring, the
+//   file's own decoded-string idiom. This is an earned-red candidate:
+//   if the pre-fix run printed GREEN on scenario 2, the "coincidence"
+//   reading is confirmed and the boundary assertion was untested.
+//
 // Run: node ./src/fixtures/f11.ts
 // =============================================================================
 
@@ -147,8 +156,12 @@ async function scenarioThreshold(): Promise<void> {
     const checkpointCount = countSubstring(raw, '"type":"log.checkpoint"');
     check('threshold: auto-checkpoint emitted mid-stream (plus shutdown)',
           checkpointCount >= 2, `got ${checkpointCount}`);
+    // FIXED 2026-10-29: string needle against raw Uint8Array coerced to
+    // NaN and always returned false. Decoded comparison via the file's
+    // own countSubstring idiom — the boundary assertion is now actually
+    // capable of failing.
     check('threshold: auto-checkpoint lands at the boundary (seq 11 area)',
-          raw.includes('"last_seq":10'), 'expected a checkpoint claiming last_seq 10');
+          countSubstring(raw, '"last_seq":10') > 0, 'expected a checkpoint claiming last_seq 10');
 
     const v = await verifyChain(new FakeAdapter(fs, ROOT), SHARD, ORIGIN);
     check('threshold: chain verifies across auto-checkpoints', v.valid, v.detail);

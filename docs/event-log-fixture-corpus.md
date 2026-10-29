@@ -1,6 +1,6 @@
 ---
 source:
-status: pending
+status: living document
 para:
 context:
 description:
@@ -12,7 +12,7 @@ type: note
 word_count: 1
 language: en
 updated:
-modified: 2026-10-24T17:36:47+01:00
+modified: 
 ---
 ---
 # Vault Overseer — Event Log Fixture Corpus v0.1 (rev. 2026-10-24)
@@ -279,6 +279,94 @@ Revert of an auto-applied write restores `before` exactly, event-by-ref. Blocked
 
 **Was parked as "hostile encore owed per doctrine; corpus passed first contact." Shipped since and green:** torn-tail checkpoint, interleaved Tier-2 buffers across threshold, intermediate chain segments asserted independently. `f11-deepening.ts` runs in the tight loop; verified green in the 2026-10-24 full-suite baseline (alongside csuite's C01–C06 and the property corpus). The encore is owed no more — it is paid.
 
+
+---
+
+## F12 — Watcher file-fact producers (note.created/deleted)
+  Threat: doubled emissions, path-fused facts (the F09 Untitled
+    lesson inverted), seq consumption on silent paths (the F08
+    poison), stat drift between observation and flush, tier-of-loss
+    on dark boot, and Tier-1 facts lost while the writer is dark
+    (identity-uncertified boot, foreign-origin guard). Plus: the
+    installation black hole — a fresh origin whose spine names no
+    paths, so the heal projection examines nothing and the vault
+    is invisible.
+  Setup: spawnContext('mokka') over the FakeAdapter; a
+    WatcherLane (src/watcher/watch.ts) fed synthetic FileLike
+    events; writer attached mid-session to exercise dark-boot
+    buffering.
+  Procedure: drive every scenario group; assert disk lines, payload
+    parity, key order, seq accounting, and silence contracts.
+  Pass requires:
+    - TFile md create ⇒ exactly one note.created, actor 'user',
+      Tier-1 write-through (line on disk after the await, pending 0).
+    - Folder create/delete ⇒ ZERO events, ZERO seq consumed.
+    - Non-md create ⇒ ZERO events, ZERO seq consumed.
+    - Extension matching case-insensitive in the lane: ext 'MD' IS
+      a note and emits.
+    - Untitled lifecycle: create→delete→create same path ⇒ THREE
+      facts (two created, one deleted with the FIRST creation's sha
+      as its tombstone) — facts never fused by path.
+    - Causal order on disk: events in emission order, seq contiguous.
+    - Dark boot: facts observed while the writer is dark are
+      captured with stats AT OBSERVATION TIME and flushed in order
+      on attach.
+    - Arming: flushAfterAttach() discloses overflow, drains AND
+      arms; post-attach facts append directly.
+    - Dark-buffer overflow (cap 2): third create while dark drops
+      the OLDEST, survivors flush in order, overflow disclosed
+      through reportIntegrity — never a silent loss.
+    - Unknown-path delete: path-only tombstone, no fabricated sha.
+    - Storm: 50 rapid creates ⇒ 50 events, contiguous seq, no loss,
+      no coalescing.
+    - Sync-arrival attribution: actor 'user' (DECLARED v1 limitation,
+      registered roadmap debt — asserted so the limitation is at
+      least uniform, never intermittent).
+    - Reconcile (rev C): fresh spine ⇒ every vault path emitted
+      with real stat/sha and its tombstone populated; second run ⇒
+      ZERO; partial spine ⇒ exactly the gaps; unarmed lane ⇒
+      refusal (-1) with ZERO buffer growth; create→delete→reconcile
+      ⇒ a third fact (no hidden ever-seen dedup).
+  Fail smells: create firing twice for one file; path-keyed dedup
+    fusing distinct creations; seq advancing on silent paths;
+    note.* landing in the Tier-2 buffer; stats computed at flush
+    time; dark-boot facts vanishing without disclosure; empty-array
+    checks passing vacuously; tombstones fabricating shas for
+    unobserved paths; overflow dropping NEWEST instead of OLDEST;
+    reconcile re-emitting known paths (per-reload cost); reconcile
+    running dark and truncating the inventory through the cap.
+  Fixture: src/fixtures/f12.ts (shipped 2026-10-25, green 2026-10-29)
+  Status: ✅ CERTIFIED (2026-10-29) — fixture green, corpus entry live.
+
+
+
+---
+
+## F13 — Subscriber seam (live tap on serialized queue)
+  Threat: subscriber errors propagating to the writer, subscribers
+    receiving events before disk persistence (violating "notification
+    latency == persistence latency"), and no attribution for
+    subscriber failures in integrity reports.
+  Setup: EventLog with subscribe() hook; fake adapter; multiple
+    subscribers registered simultaneously.
+  Procedure: drive the subscriber seam contract scenarios (S1–S5).
+  Pass requires:
+    - S1: Single subscriber receives all event categories (Tier-1,
+      Tier-2, checkpoint); notification fires AFTER disk append.
+    - S2: Multiple subscribers receive in FIFO registration order.
+    - S3: Unsubscription stops delivery; others unaffected.
+    - S4: Subscriber throw logs `log.integrity` with subscriber name;
+      writer continues (no propagation).
+    - S5: Tier-2 notifications fire only after flush (idle timeout
+      + hard-cap variants); no premature notification.
+  Fail smells: subscriber throws crashing the writer; Tier-2
+    notifications before flush; out-of-order delivery; integrity
+    reports without subscriber names; unsubscribe failing silently.
+Fixture: src/fixtures/f13.ts (shipped 2026-10-29, green 2026-10-29, 30 checks, 5 scenarios — one legitimate first-contact red: S3 fixture arithmetic, fixed same session) 
+Status: ✅ CERTIFIED — seam live, hazard ruling still owed.
+
+
+
 ---
 
 ## Secondary clauses demanding fixtures (parked, not forgotten)
@@ -288,7 +376,7 @@ Remaining parked entries after the 2026-10-24 promotions:
 - ~~F09 farewell-flush dwell event~~ — **promoted 2026-10-24, certified** (above, with semantics correction)
 - ~~F11 deepening~~ — **promoted 2026-10-24, green** (above)
 - **F07 foreign-origin guard** — kept parked with a status nuance (guard live in code, fixture owed)
-- **F08 no-op modification dedup** — kept parked, blocked on the file watcher
+~~F08 no-op modification dedup~~ — **promoted 2026-10-28, certified** (full entry above, with sequencing-ruling precedent for new subsystems; deferred continuity probe registered there)
 - **F10 `write.reverted` replay** — kept parked, blocked on Plugin 2
 - **Tier-2-first flush after torn-tail boot** — registered 2026-10-24 under F01's boundary note
 
