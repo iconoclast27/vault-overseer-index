@@ -7,6 +7,45 @@
 // F03 heal scan, and expose the Plugin 2 seam. Everything here is wiring;
 // the spine's semantics live in src/eventlog/*.
 //
+// 0.1.8-bound — F14: FOLDER RENAME TRANSCRIPTION (2026-10-30):
+//
+//   The TFolder branch of onVaultRename unmutes. Folder renames now
+//   emit folder.renamed (types.ts event union + serializer case landed
+//   this session; Event Log Schema v0.2 ledger: {from, to}, Tier-1
+//   write-through — mass-invalidation is a file fact, loss on crash
+//   not tolerated, same family as note.renamed).
+//
+//   ORDER (ruled 2026-10-30): cancelPrefix FIRST, then the emission —
+//   pending state dies before the fact lands; no window exists in
+//   which the folder.renamed line is on the spine while a
+//   stale-addressed planner observation still sits pending. The gate
+//   rewrite sits between them (adapter judgment: synchronous,
+//   independent of the writer's mood, preserves "kill state, fix
+//   addresses, record fact" as the read order).
+//
+//   Consequences downstream, all single-implementation:
+//     - planner rev B: cancelPrefix(from) kills pending modifies under
+//       from/ (boundary prefix+'/', gate.renamePrefix's discipline,
+//       mirrored; observations die with the address, no migration —
+//       boot-heal covers the renamed subtree).
+//     - projection.ts: the folder.renamed case folds in the ordered
+//       live-set walk (cold-replay and future subscriber seam share
+//       one implementation — renderEmbedInput precedent).
+//     - f14.ts: fixture earns the contract from CONTRACT TEXT (corpus
+//       doctrine, F08 precedent).
+//
+//   Also closes the slot-4 header debt: the on('modify') LINE CITATION
+//   is delivered — obsidian.d.ts l.10439, verified 2026-10-30 (grep
+//   receipt, live-receipt session):
+//     on(name: 'modify', callback: (file: TAbstractFile) => any,
+//        ctx?: any): EventRef;
+//   The typecheck-only shape receipt from 2026-10-29 is now a full
+//   citation. The planner wiring it anchors was live-verified the
+//   same day (spine seq 512–516, test vault, origin Desktop): four
+//   note.modified with distinct shas on distinct edits, one
+//   note.opened with dwell 10 — planner → scheduler → writer chain
+//   confirmed on production evidence, not hypothesis.
+//
 // 0.1.7-bound — PLANNER WIRING (frontier slot 4, 2026-10-29):
 //
 //   The note.modified producer (src/planner/planner.ts, rev A, F08-
@@ -21,8 +60,8 @@
 //     obsidian.d.ts typings — first draft wrongly assumed TFile and the
 //     compiler caught it (TS2739 at the registration site). Handler now
 //     guards with instanceof TFile, same pattern as create/delete. LINE
-//     CITATION still owed — verify the obsidian.d.ts line number before
-//     merge; the shape is typecheck-verified, the citation is not.
+//     CITATION: obsidian.d.ts l.10439 — delivered 2026-10-30, see the
+//     0.1.8 block.
 //   - ROUTING (ruled 2026-10-29): routeCreate AND routeRestore both
 //     forward through the watcher lane's create path, GUARDED. Dead-on-
 //     spine + alive-on-disk re-creating is exactly reconcile's S13
@@ -49,15 +88,13 @@
 //     race dispose()'s queue join and drop on this.log = null.
 //     Unload-window loss extends the planner's declared crash-window
 //     limitation; boot-heal is the recovery path.
-//   - FOLDER-RENAME STALE-PENDING GAP (registered, unmitigated in v1):
-//     a pending modify under a renamed folder SURVIVES the rename —
-//     folder renames emit no spine event (folder.renamed still pending
-//     transcription) and the planner exposes no prefix cancel — so the
-//     flush emits note.modified against the STALE address. Bounded:
-//     the projection already considered the path live, heal covers the
-//     divergence. Systemic fix: folder.renamed + planner rev B
-//     cancelPrefix (mirroring gate.renamePrefix) — a ruled design
-//     change, not adapter territory.
+//   - FOLDER-RENAME STALE-PENDING GAP — CLOSED 2026-10-30 by the F14
+//     wiring (folder.renamed emission + planner rev B cancelPrefix —
+//     see the 0.1.8 block). Kept for the record: a pending modify
+//     under a renamed folder previously SURVIVED the rename and
+//     flushed against the STALE address, bounded by heal. The fix
+//     was ruled a design change, not improvised adapter territory,
+//     and it has now shipped.
 //   - asModifiedPayload joins the registered bridge-debt family
 //     (f12.ts, watcher closure, this one) — typing watch.ts's payload
 //     surface at source retires all three.
@@ -174,6 +211,11 @@
 //                ruling: a new event type transcribes only against
 //                its fixture-loaded consumer, and the index's
 //                subscriber seam is the committed future consumer.
+//                [SUPERSEDED
+//                2026-10-30 (F14): the transcript ruling landed, and
+//                the F13-certified subscriber seam is the consumer —
+//                the branch now emits folder.renamed after cancelling
+//                planner pendings under the old prefix. See 0.1.8.]
 //                Until ruled, the branch rewrites gate prefixes and
 //                emits nothing.
 //
@@ -300,10 +342,12 @@
 //   — obsidian.d.ts l.10451. Verified 2026-10-24. TFolder instanceof
 //   disambiguates; folder renames arrive on the same event (no
 //   separate folder-rename hook exists).
-//   on('modify', (file: TAbstractFile) => any, ctx?) — SHAPE
-//   VERIFIED via typecheck 2026-10-29 (callback param is
-//   TAbstractFile per obsidian.d.ts typings; first draft wrongly
-//   assumed TFile — TS2739 caught it). LINE CITATION still owed.
+//   on('modify', (file: TAbstractFile) => any, ctx?) — obsidian.d.ts
+//   l.10439. Shape verified via typecheck 2026-10-29 (callback param
+//   is TAbstractFile; first draft wrongly assumed TFile — TS2739
+//   caught it). LINE CITATION DELIVERED 2026-10-30 (grep receipt):
+//   `on(name: 'modify', callback: (file: TAbstractFile) => any,
+//   ctx?: any): EventRef;` — full citation, debt closed.
 //   onLayoutReady(callback: () => any): void — obsidian.d.ts l.10740,
 //   with the create-at-load guidance at l.10429. Verified 2026-10-25.
 //   getMarkdownFiles(): TFile[] — obsidian.d.ts l.10418. Verified
@@ -954,27 +998,38 @@ export default class VaultOverseerIndex extends Plugin {
     }
 
     // ---------------------------------------------------------------------------
-    // Rename adapter (thin wiring; F05a, 2026-10-24)
+    // Rename adapter (thin wiring; F05a, 2026-10-24; F14, 2026-10-30)
     // ---------------------------------------------------------------------------
 
     /**
      * Vault rename receipt (obsidian.d.ts l.10451): callback receives
      * the renamed TAbstractFile plus its old path. Branches on which
      * it got — file renames are our event (note.renamed, F05a); folder
-     * renames rewrite the gate's prefixes (mass invalidation of
-     * storage addresses; spine emission pending the types.ts ruling).
+     * renames mass-invalidate storage addresses and now emit
+     * folder.renamed (F14).
      */
     private onVaultRename(file: TAbstractFile, oldPath: string): void {
         if (file instanceof TFolder) {
-            // Folder rename: every known path under oldPath/ is stale.
-            // Rewrite the gate's addresses; emit nothing yet (pending
-            // the folder.renamed transcription ruling).
+            // Folder rename (F14, 2026-10-30): every known path under
+            // oldPath/ is stale — mass-invalidation, ONE fact recorded,
+            // consequences resolved by the projection fold.
             //
-            // KNOWN GAP (slot 4, declared in the header): pending planner
-            // modifies under this prefix SURVIVE the rename — the
-            // planner has no prefix cancel. Systemic fix is folder.renamed
-            // + planner rev B cancelPrefix; not improvised here.
+            // ORDER (ruled 2026-10-30): cancel first, then rewrite the
+            // gate, then emit. The planner's pending state dies BEFORE
+            // the spine fact lands — no window where the
+            // folder.renamed line coexists with a stale-addressed
+            // pending observation (the 0.1.7 gap, closed). The gate
+            // rewrite is synchronous and independent (accrual truth
+            // never depends on the writer's mood); the emission rides
+            // the serialized queue with everything else.
+            //
+            // cancelPrefix returns its kill count; deliberately
+            // unconsumed here — quiet on the spine, the cancelling
+            // event IS the record (planner rev B ruling). The count
+            // serves fixtures and receipts, not an integrity line.
+            this.plannerLane?.cancelPrefix(oldPath);
             this.dwellGate.renamePrefix(oldPath, file.path);
+            void this.emitFolderRename(oldPath, file.path);
             return;
         }
 
@@ -1002,6 +1057,21 @@ export default class VaultOverseerIndex extends Plugin {
     private async emitRename(from: string, to: string): Promise<void> {
         if (this.log === null) return; // writer dark: Rung 2 pending or foreign-origin
         await this.log.appendEvent('user', 'note.renamed', { from, to });
+    }
+
+    /**
+     * Tier-1 write-through for folder.renamed (F14, 2026-10-30): a
+     * folder rename is a mass-invalidation file fact — same family
+     * as note.renamed, loss on crash not tolerated, buffer carried
+     * ahead so disk order == seq order. ONE event, N re-addressed
+     * paths; the projection fold (not the emitter) resolves the
+     * consequences — the emitter records the fact, projectPaths()
+     * does the walking. Drops silently while dark, same as every
+     * adapter emission.
+     */
+    private async emitFolderRename(from: string, to: string): Promise<void> {
+        if (this.log === null) return; // writer dark: Rung 2 pending or foreign-origin
+        await this.log.appendEvent('user', 'folder.renamed', { from, to });
     }
 
     // ---------------------------------------------------------------------------

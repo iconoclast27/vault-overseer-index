@@ -39,6 +39,8 @@ function payloadInOrder(event) {
       return { from: event.payload.from, to: event.payload.to };
     case "note.conflicted":
       return { path: event.payload.path, conflict_copy_path: event.payload.conflict_copy_path };
+    case "folder.renamed":
+      return { from: event.payload.from, to: event.payload.to };
     case "note.opened":
       return { path: event.payload.path, dwell: event.payload.dwell };
     case "chunk.indexed":
@@ -534,6 +536,13 @@ async function mergeScan(source, eventsDir) {
 }
 
 // src/eventlog/projection.ts
+function asPrefix(folder) {
+  return folder.replace(/\/+$/, "") + "/";
+}
+function reAddress(path, fromPrefix, toPrefix) {
+  if (!path.startsWith(fromPrefix)) return null;
+  return toPrefix + path.slice(fromPrefix.length);
+}
 function projectPaths(events) {
   const livePaths = /* @__PURE__ */ new Set();
   const deadPaths = /* @__PURE__ */ new Set();
@@ -552,6 +561,18 @@ function projectPaths(events) {
       if (typeof e.to === "string") {
         livePaths.add(e.to);
         deadPaths.delete(e.to);
+      }
+    } else if (t === "folder.renamed") {
+      if (typeof e.from === "string" && typeof e.to === "string") {
+        const fromPrefix = asPrefix(e.from);
+        const toPrefix = asPrefix(e.to);
+        for (const path of [...livePaths]) {
+          const moved = reAddress(path, fromPrefix, toPrefix);
+          if (moved === null) continue;
+          livePaths.delete(path);
+          livePaths.add(moved);
+          deadPaths.delete(moved);
+        }
       }
     } else if (t === "note.deleted") {
       if (typeof e.path === "string") {
@@ -1414,6 +1435,18 @@ function makePlanner(deps, ctx, options = {}) {
       pending.delete(path);
       if (pending.size === 0) cancelWindow();
     },
+    cancelPrefix(from) {
+      const fromPrefix = from.endsWith("/") ? from : `${from}/`;
+      let cancelled = 0;
+      for (const key of [...pending.keys()]) {
+        if (key.startsWith(fromPrefix)) {
+          pending.delete(key);
+          cancelled++;
+        }
+      }
+      if (pending.size === 0) cancelWindow();
+      return cancelled;
+    },
     arm() {
       armed = true;
     },
@@ -1752,18 +1785,20 @@ var VaultOverseerIndex = class extends import_obsidian.Plugin {
     await this.log.appendEvent("user", "note.opened", { path, dwell });
   }
   // ---------------------------------------------------------------------------
-  // Rename adapter (thin wiring; F05a, 2026-10-24)
+  // Rename adapter (thin wiring; F05a, 2026-10-24; F14, 2026-10-30)
   // ---------------------------------------------------------------------------
   /**
    * Vault rename receipt (obsidian.d.ts l.10451): callback receives
    * the renamed TAbstractFile plus its old path. Branches on which
    * it got — file renames are our event (note.renamed, F05a); folder
-   * renames rewrite the gate's prefixes (mass invalidation of
-   * storage addresses; spine emission pending the types.ts ruling).
+   * renames mass-invalidate storage addresses and now emit
+   * folder.renamed (F14).
    */
   onVaultRename(file, oldPath) {
     if (file instanceof import_obsidian.TFolder) {
+      this.plannerLane?.cancelPrefix(oldPath);
       this.dwellGate.renamePrefix(oldPath, file.path);
+      void this.emitFolderRename(oldPath, file.path);
       return;
     }
     this.plannerLane?.cancelPending(oldPath);
@@ -1781,6 +1816,20 @@ var VaultOverseerIndex = class extends import_obsidian.Plugin {
   async emitRename(from, to) {
     if (this.log === null) return;
     await this.log.appendEvent("user", "note.renamed", { from, to });
+  }
+  /**
+   * Tier-1 write-through for folder.renamed (F14, 2026-10-30): a
+   * folder rename is a mass-invalidation file fact — same family
+   * as note.renamed, loss on crash not tolerated, buffer carried
+   * ahead so disk order == seq order. ONE event, N re-addressed
+   * paths; the projection fold (not the emitter) resolves the
+   * consequences — the emitter records the fact, projectPaths()
+   * does the walking. Drops silently while dark, same as every
+   * adapter emission.
+   */
+  async emitFolderRename(from, to) {
+    if (this.log === null) return;
+    await this.log.appendEvent("user", "folder.renamed", { from, to });
   }
   // ---------------------------------------------------------------------------
   // Watcher adapter (thin wiring; F12, 2026-10-25)

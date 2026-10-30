@@ -25,6 +25,9 @@
 //       * note.renamed for a path cancels its pending modify — rename is
 //         semantically a modify subclass; the rename's own post-rename sha
 //         check covers content drift (session ruling 2026-10-28)
+//       * folder.renamed cancels every pending modify under the old prefix
+//         (rev B below) — mass-invalidation supersedes individually
+//         observed modifications at those now-dead addresses
 //       * a modify for a path UNKNOWN to the spine routes to the create
 //         lane (routeCreate) — never a bare modify resurrecting from nowhere
 //       * a modify for a path the spine says is DEAD routes to reconcile
@@ -46,6 +49,40 @@
 //     Dropping without an integrity lane wired is a declared limit — the
 //     disclosure hook exists precisely so main.ts can wire it.
 //
+// rev B (2026-10-30) — F14: cancelPrefix. Closes the stale-pending gap
+//   registered in main.ts's header (slot-4 wiring): a pending modify
+//   observed under a folder's old prefix previously SURVIVED a folder
+//   rename and flushed against a stale storage address. Session rulings
+//   2026-10-30, in force:
+//     - Signature: cancelPrefix(from) — the DESTINATION is not a parameter.
+//       Pending observations DIE with the address; they do not migrate.
+//       Rationale: stock Obsidian emits no child modify events on a folder
+//       rename, so there is no fresh observation at the new address to
+//       re-key to — synthesizing one would fabricate an observation the
+//       vault never produced. Coverage for the renamed subtree is heal's
+//       regime (mtime/sha drift from last indexed re-derives at boot),
+//       exactly the crash-window limitation's recovery path, already
+//       ratified in rev A.
+//     - The method RETURNS the cancelled count: quiet in the spine (the
+//       cancelling folder.renamed event IS the record — no integrity line,
+//       no second event), but countable, so the F14 fixture asserts
+//       cancellation through the public API without violating corpus
+//       rule 1 (no reaching into internals; if a test needs an internal,
+//       the internal is really a public).
+//     - Ordering (ruled): the adapter calls cancelPrefix BEFORE the
+//       folder.renamed emission — pending state dies before the fact
+//       lands. No window exists in which the folder.renamed line is on
+//       the spine while a stale-addressed observation still sits pending.
+//     - Boundary discipline mirrors gate.renamePrefix exactly: matching
+//       is prefix + '/' (so 'Area' never captures 'Area 2/x.md'), and
+//       matching is exact-path-free — the folder itself is not a path in
+//       the pending map (folders never reach the lane; isEmittable
+//       filters them at observation), so only descendant paths matter.
+//     - Window discipline: cancelling the LAST pending path also cancels
+//       the debounce window (cancelPending's precedent — an armed timer
+//       over an empty map is a flush that will no-op; cheaper to stand
+//       down now and let the next observation re-arm).
+//
 // DECLARED LIMITATIONS (loud, not hidden):
 //   - Crash inside the coalescing window loses the modify. Recovery is
 //     boot-heal (F03's regime). note.modified is Tier-1 AT REST, deferred
@@ -63,8 +100,10 @@
 //
 // Pure module, injected deps — the gate.ts / watch.ts tradition. main.ts
 // maps TAbstractFile to onVaultModify, calls cancelPending from the delete
-// and rename handlers, wires arm() at writer attach, and supplies the
-// scheduler (setTimeout wrappers) if automatic windows are wanted.
+// and rename handlers, calls cancelPrefix from the FOLDER-rename handler
+// (before the folder.renamed emission, per the rev B ruling), wires arm()
+// at writer attach, and supplies the scheduler (setTimeout wrappers) if
+// automatic windows are wanted.
 //
 // Emission payload in schema canon order: path, mtime, bytes, content_sha
 // (Event Log Schema v0.2, file events table).
@@ -161,6 +200,19 @@ export interface PlannerLane {
     onVaultModify(file: FileLike): Promise<void>;
     /** Cancel a path's pending modify — adapter calls this on delete and rename. */
     cancelPending(path: string): void;
+    /**
+     * Cancel every pending modify under a folder prefix — adapter calls
+     * this from the FOLDER-rename handler, BEFORE the folder.renamed
+     * emission (rev B ruling, 2026-10-30). Boundary-matched: prefix+'/',
+     * so 'Area' never cancels 'Area 2/x.md' (gate.renamePrefix's
+     * discipline, mirrored). Observations DIE with the address — no
+     * migration, no fabricated re-observation at the destination; the
+     * renamed subtree's coverage is heal's regime.
+     *
+     * Returns the count of pending observations cancelled, for receipts
+     * and fixture assertions through the public API.
+     */
+    cancelPrefix(from: string): number;
     /** Arm the lane (writer attached). Pre-arm observations are dropped, heal-covered. */
     arm(): void;
     /** Flush the coalescing window: spine read, dedup, emission, routing. */
@@ -437,6 +489,34 @@ export function makePlanner(
             // cancelling event IS the record.
             pending.delete(path);
             if (pending.size === 0) cancelWindow();
+        },
+        cancelPrefix(from: string): number {
+            // rev B (F14, 2026-10-30): a folder rename mass-invalidates
+            // every storage address beneath `from/`. Pending observations
+            // at those addresses die here — BEFORE the adapter emits
+            // folder.renamed (ruled; the ordering lives in main.ts).
+            //
+            // Boundary discipline mirrors gate.renamePrefix: the match
+            // is prefix + '/', so 'Area' never captures 'Area 2/x.md'.
+            // The folder itself is never a pending key (folders are
+            // filtered at observation), so descendant-only matching is
+            // the whole surface.
+            //
+            // Observations DIE, they do not migrate: no fabricated
+            // re-observation at the destination (the vault produced no
+            // such event), coverage re-derives via boot-heal. Quiet on
+            // the spine — folder.renamed IS the record — but the count
+            // returns so fixtures and adapters can receipt the kill.
+            const fromPrefix = from.endsWith('/') ? from : `${from}/`;
+            let cancelled = 0;
+            for (const key of [...pending.keys()]) {
+                if (key.startsWith(fromPrefix)) {
+                    pending.delete(key);
+                    cancelled++;
+                }
+            }
+            if (pending.size === 0) cancelWindow(); // empty map: stand down
+            return cancelled;
         },
         arm(): void {
             armed = true;

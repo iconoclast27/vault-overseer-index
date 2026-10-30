@@ -28,6 +28,18 @@
 //   narrowing flows from `event.type`. Behavior is UNCHANGED: the same
 //   fields in the same order produce the same bytes. Runtime was never
 //   wrong; the checker was never satisfied.
+//
+// F14 ADDITION (2026-10-30): 'folder.renamed' transcribed. Tier 1 file
+//   fact (mass-invalidation of storage addresses), payload {from, to}
+//   mirroring note.renamed — per the Schema v0.2 ledger entry rev.
+//   2026-10-24. Consumer condition met: the subscriber seam (F13) is
+//   the fixture-loaded consumer; the transcription doctrine is satisfied
+//   for the first new event type since the doctrine was written. Fixture
+//   F14 drafted from contract text (corpus addendum rev. 2026-10-30);
+//   implementation sequence: types.ts (this file) → planner rev B
+//   cancelPrefix → main.ts unmuting of the TFolder branch. Session
+//   ruling 2026-10-30: cancelPrefix fires BEFORE the folder.renamed
+//   emission — pending state dies before the fact lands.
 // =============================================================================
 
 /** Envelope schema version. Forward-only migrations keyed on this. */
@@ -63,6 +75,7 @@ export type EventType =
 | 'note.deleted'
 | 'note.renamed'
 | 'note.conflicted'
+| 'folder.renamed'
 // Tier 2 — buffered
 | 'note.opened'
 | 'chunk.indexed'
@@ -103,6 +116,19 @@ export interface NoteRenamedPayload {
 export interface NoteConflictedPayload {
     readonly path: VaultPath;
     readonly conflict_copy_path: VaultPath;
+}
+
+/**
+ * F14 (2026-10-30): a folder was renamed from `from` to `to`. One event,
+ * not N children — the folder rename is a single mass-invalidation fact
+ * covering every storage address beneath `from/`. The projection's
+ * prefix-fold resolves descendants; links (Obsidian's province) and
+ * chunk identity (path-independent vh) are untouched by construction.
+ * Mirrors NoteRenamedPayload's field order exactly.
+ */
+export interface FolderRenamedPayload {
+    readonly from: VaultPath;
+    readonly to: VaultPath;
 }
 
 export interface NoteOpenedPayload {
@@ -163,6 +189,7 @@ export interface NoteModifiedEvent extends Envelope { readonly type: 'note.modif
 export interface NoteDeletedEvent extends Envelope { readonly type: 'note.deleted'; readonly payload: NoteDeletedPayload; }
 export interface NoteRenamedEvent extends Envelope { readonly type: 'note.renamed'; readonly payload: NoteRenamedPayload; }
 export interface NoteConflictedEvent extends Envelope { readonly type: 'note.conflicted'; readonly payload: NoteConflictedPayload; }
+export interface FolderRenamedEvent extends Envelope { readonly type: 'folder.renamed'; readonly payload: FolderRenamedPayload; }
 export interface NoteOpenedEvent extends Envelope { readonly type: 'note.opened'; readonly payload: NoteOpenedPayload; }
 export interface ChunkIndexedEvent extends Envelope { readonly type: 'chunk.indexed'; readonly payload: ChunkIndexedPayload; }
 export interface ChunkEvictedEvent extends Envelope { readonly type: 'chunk.evicted'; readonly payload: ChunkEvictedPayload; }
@@ -175,6 +202,7 @@ export type VaultOverseerEvent =
 | NoteDeletedEvent
 | NoteRenamedEvent
 | NoteConflictedEvent
+| FolderRenamedEvent
 | NoteOpenedEvent
 | ChunkIndexedEvent
 | ChunkEvictedEvent
@@ -206,6 +234,8 @@ function payloadInOrder(event: VaultOverseerEvent): Record<string, unknown> {
             return { from: event.payload.from, to: event.payload.to };
         case 'note.conflicted':
             return { path: event.payload.path, conflict_copy_path: event.payload.conflict_copy_path };
+        case 'folder.renamed':
+            return { from: event.payload.from, to: event.payload.to };
         case 'note.opened':
             return { path: event.payload.path, dwell: event.payload.dwell };
         case 'chunk.indexed':
